@@ -1,0 +1,12 @@
+.git
+.github
+.gitignore
+.vscode
+.idea
+*.md
+!README.md
+LICENSE
+Makefile
+docker-compose*.yml
+config.yaml
+data/

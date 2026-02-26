@@ -1,0 +1,50 @@
+services:
+  # ── RTSP Keepalive Proxy ──────────────────────────────────────────
+  rtsp-proxy:
+    build:
+      context: .
+      args:
+        VERSION: "${VERSION:-dev}"
+    image: rtsp-keepalive-proxy:latest
+    container_name: rtsp-proxy
+    restart: unless-stopped
+    volumes:
+      - ./config.yaml:/etc/rtsp-proxy/config.yaml:ro
+    ports:
+      - "8554:8554"   # RTSP output
+      - "8090:8080"   # Health / status (remapped to avoid conflict)
+    environment:
+      - TZ=Europe/Paris
+      # Camera credentials (referenced in config.yaml via ${VAR})
+      - CAM_USER=admin
+      - CAM_PASS_JARDIN=L202EA64
+      - CAM_PASS_ENTREE=L2DEB678
+    networks:
+      - surveillance
+
+  # ── Frigate NVR (reference – adapt to your setup) ─────────────────
+  # frigate:
+  #   image: ghcr.io/blakeblackshear/frigate:stable
+  #   container_name: frigate
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - rtsp-proxy
+  #   volumes:
+  #     - ./frigate/config.yml:/config/config.yml:ro
+  #     - /mnt/surveillance:/media/frigate
+  #   ports:
+  #     - "5000:5000"   # Web UI
+  #     - "8971:8971"   # API
+  #   devices:
+  #     - /dev/bus/usb:/dev/bus/usb   # Coral TPU
+  #     - /dev/dri/renderD128         # VAAPI
+  #   environment:
+  #     - TZ=Europe/Paris
+  #     - FRIGATE_MQTT_USER=mqtt_user
+  #     - FRIGATE_MQTT_PASSWORD=mqtt_pass
+  #   networks:
+  #     - surveillance
+
+networks:
+  surveillance:
+    driver: bridge

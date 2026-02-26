@@ -1,0 +1,35 @@
+# Binaries
+/rtsp-keepalive-proxy
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config with credentials (use config.yaml.example as template)
+config.yaml
+
+# Docker volumes
+data/

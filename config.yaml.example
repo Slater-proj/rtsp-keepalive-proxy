@@ -1,0 +1,39 @@
+server:
+  # RTSP listen port (output towards Frigate / consumers)
+  rtsp_port: 8554
+  # HTTP port for health checks and metrics
+  health_port: 8080
+  # Log level: debug, info, warn, error
+  log_level: info
+
+# Default values applied to all cameras unless overridden
+defaults:
+  # Enable battery/wifi mode (fallback when camera sleeps)
+  battery_mode: true
+  # Interval between reconnection attempts
+  retry_interval: 3s
+  # Duration without packets before camera is considered asleep
+  timeout: 10s
+  # FPS of the fallback still-image stream
+  fallback_fps: 1
+  # Codec: auto (detect from source), h264, h265
+  codec: auto
+
+# Each entry creates an RTSP output path: rtsp://<proxy>:<port>/<name>
+# If source_low is set, a second path is created: rtsp://<proxy>:<port>/low_<name>
+cameras:
+  jardin:
+    source: "rtsp://${CAM_USER}:${CAM_PASS_JARDIN}@192.168.1.50:554/cam/realmonitor?channel=1&subtype=0"
+    source_low: "rtsp://${CAM_USER}:${CAM_PASS_JARDIN}@192.168.1.50:554/cam/realmonitor?channel=1&subtype=1"
+    battery_mode: true
+    retry_interval: 3s
+    timeout: 10s
+    fallback_fps: 1
+
+  entree:
+    source: "rtsp://${CAM_USER}:${CAM_PASS_ENTREE}@192.168.1.52:554/cam/realmonitor?channel=1&subtype=0"
+    source_low: "rtsp://${CAM_USER}:${CAM_PASS_ENTREE}@192.168.1.52:554/cam/realmonitor?channel=1&subtype=1"
+    battery_mode: true
+    retry_interval: 3s
+    timeout: 10s
+    fallback_fps: 1
