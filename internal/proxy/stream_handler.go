@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"runtime/debug"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -688,7 +687,7 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		h++
 	}
 
-	// Write PNG to a temp file for FFmpeg to loop.
+	// Write PNG to a temp file for FFmpeg.
 	tmpFile, err := os.CreateTemp("", fmt.Sprintf("fallback-%s-*.png", sh.Name))
 	if err != nil {
 		sh.log.Error("fallback: create temp file", "error", err)
@@ -704,19 +703,32 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 	}
 	tmpFile.Close()
 
-	// Build FFmpeg command for continuous H.264/H.265 output.
-	encoder := "libx264"
+	// Bail out early if context was cancelled during file I/O.
+	if ctx.Err() != nil {
+		return
+	}
+
+	// ── Encode ONE IDR frame with FFmpeg ─────────────────────────────
+	//
+	// Previous approach used a continuous FFmpeg process with a streaming
+	// Annex-B parser piped through goroutines/channels. This was fragile:
+	// pipe buffering and byte-level parser edge cases could silently
+	// corrupt NAL unit boundaries, producing garbage NAL types (2/3/4)
+	// that FFmpeg on the consumer side reports as "data partitioning is
+	// not implemented".
+	//
+	// New approach: run FFmpeg once (-frames:v 1), batch-parse the output
+	// with ParseAnnexB, and re-emit the same [SPS, PPS, IDR] access unit
+	// at the configured FPS. Zero goroutines, zero channels, zero
+	// streaming parser state — just a simple ticker loop.
+
+	encCodec := "libx264"
 	outFmt := "h264"
 	var encoderArgs []string
 
-	fpsStr := strconv.Itoa(fps)
-
-	// keyint=1 → every frame is an IDR with SPS/PPS.  This is critical:
-	// consumers can start decoding at any point and never see
-	// "missing picture" or "data partitioning" errors.
 	switch codec {
 	case "h265":
-		encoder = "libx265"
+		encCodec = "libx265"
 		outFmt = "hevc"
 		encoderArgs = []string{
 			"-preset", "ultrafast",
@@ -733,10 +745,9 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 
 	args := []string{
 		"-hide_banner", "-loglevel", "error",
-		"-loop", "1",
 		"-i", tmpPath,
-		"-c:v", encoder,
-		"-r", fpsStr,
+		"-c:v", encCodec,
+		"-frames:v", "1",
 	}
 	args = append(args, encoderArgs...)
 	args = append(args,
@@ -746,33 +757,45 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		"pipe:1",
 	)
 
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		sh.log.Error("fallback: stdout pipe", "error", err)
-		return
-	}
+	// Use a dedicated timeout so encoding completes even if the
+	// parent context is cancelled while FFmpeg is running.
+	encCtx, encCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer encCancel()
 
+	cmd := exec.CommandContext(encCtx, "ffmpeg", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	if err := cmd.Start(); err != nil {
-		sh.log.Error("fallback: FFmpeg start", "error", err)
+	output, err := cmd.Output()
+	if err != nil {
+		sh.log.Error("fallback: FFmpeg encode failed",
+			"error", err, "stderr", stderr.String())
 		return
 	}
-	defer func() {
-		cmd.Process.Kill()
-		cmd.Wait()
-		if stderr.Len() > 0 {
-			sh.log.Debug("fallback FFmpeg stderr", "output", stderr.String())
+
+	// Batch-parse the Annex-B output into individual NAL units.
+	au := fallback.ParseAnnexB(output)
+	if len(au) == 0 {
+		sh.log.Error("fallback: no NAL units in FFmpeg output",
+			"outputLen", len(output))
+		return
+	}
+
+	// Log NAL unit details (helps debugging Frigate issues).
+	for i, n := range au {
+		if len(n) == 0 {
+			continue
 		}
-	}()
+		nalType := n[0] & 0x1F
+		if codec == "h265" && len(n) >= 2 {
+			nalType = (n[0] >> 1) & 0x3F
+		}
+		sh.log.Info("fallback NAL unit",
+			"idx", i, "type", nalType, "size", len(n))
+	}
 
-	sh.log.Info("fallback stream started",
-		"codec", codec, "fps", fps,
-		"size", fmt.Sprintf("%dx%d", w, h))
+	// ── Set up RTP encoder ───────────────────────────────────────────
 
-	// RTP encoder.
 	var h264Enc *rtph264.Encoder
 	var h265Enc *rtph265.Encoder
 
@@ -794,30 +817,16 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 	tsInc := clockRate / uint32(fps)
 	var ts uint32
 
-	// Goroutine: parse continuous Annex-B stream into access units.
-	auCh := make(chan [][]byte, 1)
-	go func() {
-		defer close(auCh)
-		isVCL := fallback.IsH264VCL
-		if codec == "h265" {
-			isVCL = fallback.IsH265VCL
-		}
-		nalCh := fallback.StreamNALUs(stdout)
-		var au [][]byte
-		for nalu := range nalCh {
-			au = append(au, nalu)
-			if isVCL(nalu) {
-				select {
-				case auCh <- au:
-				case <-ctx.Done():
-					return
-				}
-				au = nil
-			}
-		}
-	}()
+	sh.log.Info("fallback stream started",
+		"codec", codec, "fps", fps,
+		"size", fmt.Sprintf("%dx%d", w, h),
+		"nalus", len(au))
 
-	// Emit access units at the configured FPS.
+	// ── Emission loop ────────────────────────────────────────────────
+	// Re-emit the same pre-encoded access unit at the configured FPS.
+	// Each emission is a complete [SPS, PPS, IDR] (or HEVC equivalent)
+	// so consumers can start decoding at any point.
+
 	ticker := time.NewTicker(time.Second / time.Duration(fps))
 	defer ticker.Stop()
 
@@ -829,31 +838,21 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		case <-ticker.C:
 		}
 
-		select {
-		case au, ok := <-auCh:
-			if !ok {
-				sh.log.Info("fallback stream ended (FFmpeg exited)")
-				return
-			}
-			if codec == "h265" && h265Enc != nil {
-				if pkts, err := h265Enc.Encode(au); err == nil {
-					for _, pkt := range pkts {
-						pkt.Timestamp = ts
-						sh.writeToStream(pkt)
-					}
-				}
-			} else if h264Enc != nil {
-				if pkts, err := h264Enc.Encode(au); err == nil {
-					for _, pkt := range pkts {
-						pkt.Timestamp = ts
-						sh.writeToStream(pkt)
-					}
+		if codec == "h265" && h265Enc != nil {
+			if pkts, err := h265Enc.Encode(au); err == nil {
+				for _, pkt := range pkts {
+					pkt.Timestamp = ts
+					sh.writeToStream(pkt)
 				}
 			}
-			ts += tsInc
-		case <-ctx.Done():
-			sh.log.Info("fallback stream stopped")
-			return
+		} else if h264Enc != nil {
+			if pkts, err := h264Enc.Encode(au); err == nil {
+				for _, pkt := range pkts {
+					pkt.Timestamp = ts
+					sh.writeToStream(pkt)
+				}
+			}
 		}
+		ts += tsInc
 	}
 }
