@@ -529,6 +529,11 @@ func (sh *StreamHandler) registerCallback(
 			return
 		}
 
+		// Track SPS/PPS from the camera (initially from DESCRIBE SDP,
+		// updated from in-band parameter sets). Used to inject SPS/PPS
+		// before IDR frames when the camera omits them in-band.
+		camSPS := copyBytes(h264f.SPS)
+		camPPS := copyBytes(h264f.PPS)
 		seenIDR := false
 
 		c.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
@@ -547,10 +552,15 @@ func (sh *StreamHandler) registerCallback(
 				return
 			}
 
+			// Filter out invalid / unsupported NAL types.
+			// If the AU contains data partitioning (types 2-4),
+			// discard the entire AU.
+			au = filterH264NALUs(au)
+			if len(au) == 0 {
+				return
+			}
+
 			// Wait for the first IDR before forwarding anything.
-			// The first AUs after RTSP PLAY may be incomplete
-			// (joined mid-GOP), producing garbage NAL types that
-			// trigger "data partitioning is not implemented".
 			if !seenIDR {
 				hasIDR := false
 				for _, nalu := range au {
@@ -565,6 +575,25 @@ func (sh *StreamHandler) registerCallback(
 				seenIDR = true
 				sh.log.Info("first IDR received, camera relay starting")
 			}
+
+			// Track in-band SPS/PPS updates from the camera.
+			for _, nalu := range au {
+				if len(nalu) == 0 {
+					continue
+				}
+				switch nalu[0] & 0x1F {
+				case 7:
+					camSPS = copyBytes(nalu)
+				case 8:
+					camPPS = copyBytes(nalu)
+				}
+			}
+
+			// Ensure every IDR AU includes SPS + PPS so the bitstream
+			// is fully self-contained. Without this, downstream muxers
+			// fail with "Could not write header" because they rely on
+			// in-band parameter sets rather than SDP sprop.
+			au = ensureSPSPPS(au, camSPS, camPPS)
 
 			sh.captureKeyframeH264(au)
 
@@ -596,6 +625,9 @@ func (sh *StreamHandler) registerCallback(
 			return
 		}
 
+		camVPS := copyBytes(h265f.VPS)
+		camSPS := copyBytes(h265f.SPS)
+		camPPS := copyBytes(h265f.PPS)
 		seenIRAP := false
 
 		c.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
@@ -611,6 +643,11 @@ func (sh *StreamHandler) registerCallback(
 
 			au, err := dec.Decode(pkt)
 			if err != nil || au == nil {
+				return
+			}
+
+			au = filterH265NALUs(au)
+			if len(au) == 0 {
 				return
 			}
 
@@ -631,6 +668,24 @@ func (sh *StreamHandler) registerCallback(
 				seenIRAP = true
 				sh.log.Info("first IRAP received, camera relay starting")
 			}
+
+			// Track in-band VPS/SPS/PPS.
+			for _, nalu := range au {
+				if len(nalu) < 2 {
+					continue
+				}
+				nt := (nalu[0] >> 1) & 0x3F
+				switch nt {
+				case 32:
+					camVPS = copyBytes(nalu)
+				case 33:
+					camSPS = copyBytes(nalu)
+				case 34:
+					camPPS = copyBytes(nalu)
+				}
+			}
+
+			au = ensureVPSSPSPPS(au, camVPS, camSPS, camPPS)
 
 			sh.captureKeyframeH265(au)
 
@@ -917,17 +972,21 @@ func (sh *StreamHandler) captureKeyframeH264(au [][]byte) {
 
 	// Update SPS/PPS in the output format.
 	if sps != nil && pps != nil {
+		spsChanged := false
 		sh.mu.Lock()
 		if sh.desc != nil && len(sh.desc.Medias) > 0 {
 			if h264Fmt, ok := sh.desc.Medias[0].Formats[0].(*format.H264); ok {
+				spsChanged = !bytes.Equal(h264Fmt.SPS, sps)
 				h264Fmt.SPS = sps
 				h264Fmt.PPS = pps
 			}
 		}
 		sh.mu.Unlock()
 
-		// Also update fallback generator dimensions from new SPS.
-		sh.updateDimensionsFromSPS(sps)
+		// Only probe dimensions when SPS actually changes.
+		if spsChanged {
+			sh.updateDimensionsFromSPS(sps)
+		}
 	}
 
 	if hasIDR {
@@ -1304,4 +1363,128 @@ func addIndicatorDot(pngData []byte) []byte {
 		return nil
 	}
 	return buf.Bytes()
+}
+
+// -----------------------------------------------------------------------
+// NAL unit helpers
+// -----------------------------------------------------------------------
+
+// copyBytes returns a deep copy of a byte slice (nil-safe).
+func copyBytes(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	c := make([]byte, len(b))
+	copy(c, b)
+	return c
+}
+
+// filterH264NALUs removes empty NALUs and checks for unsupported types.
+// Returns nil (discarding the entire AU) if data partitioning NALUs
+// (types 2-4) are found, since no mainstream decoder supports them.
+func filterH264NALUs(au [][]byte) [][]byte {
+	var filtered [][]byte
+	for _, nalu := range au {
+		if len(nalu) == 0 {
+			continue
+		}
+		nt := nalu[0] & 0x1F
+		if nt >= 2 && nt <= 4 {
+			return nil // Data partitioning: discard entire AU
+		}
+		if nt == 0 || nt >= 24 {
+			continue // Unspecified or RTP-only types (shouldn't be here)
+		}
+		filtered = append(filtered, nalu)
+	}
+	return filtered
+}
+
+// filterH265NALUs removes empty NALUs and filters invalid types.
+func filterH265NALUs(au [][]byte) [][]byte {
+	var filtered [][]byte
+	for _, nalu := range au {
+		if len(nalu) < 2 {
+			continue
+		}
+		nt := (nalu[0] >> 1) & 0x3F
+		if nt > 47 {
+			continue // Reserved / unspecified
+		}
+		filtered = append(filtered, nalu)
+	}
+	return filtered
+}
+
+// ensureSPSPPS guarantees that every IDR access unit includes SPS and PPS
+// NALUs. Many cameras only send SPS/PPS in the SDP, not in-band. Without
+// in-band parameter sets, downstream muxers (Frigate recording) fail with
+// "Could not write header (incorrect codec parameters)" because they need
+// SPS/PPS to write the MP4/segment header.
+func ensureSPSPPS(au [][]byte, sps, pps []byte) [][]byte {
+	if sps == nil || pps == nil {
+		return au
+	}
+
+	hasIDR := false
+	for _, nalu := range au {
+		if len(nalu) > 0 && (nalu[0]&0x1F) == 5 {
+			hasIDR = true
+			break
+		}
+	}
+	if !hasIDR {
+		return au
+	}
+
+	// Rebuild AU: SPS, PPS, then all non-parameter-set NALUs.
+	result := make([][]byte, 0, len(au)+2)
+	result = append(result, sps, pps)
+	for _, nalu := range au {
+		if len(nalu) == 0 {
+			continue
+		}
+		nt := nalu[0] & 0x1F
+		if nt == 7 || nt == 8 {
+			continue // Skip original SPS/PPS; we prepended ours
+		}
+		result = append(result, nalu)
+	}
+	return result
+}
+
+// ensureVPSSPSPPS is the H.265 equivalent: ensures VPS, SPS, and PPS are
+// present before IRAP frames.
+func ensureVPSSPSPPS(au [][]byte, vps, sps, pps []byte) [][]byte {
+	if vps == nil || sps == nil || pps == nil {
+		return au
+	}
+
+	hasIRAP := false
+	for _, nalu := range au {
+		if len(nalu) >= 2 {
+			nt := (nalu[0] >> 1) & 0x3F
+			if nt >= 16 && nt <= 21 {
+				hasIRAP = true
+				break
+			}
+		}
+	}
+	if !hasIRAP {
+		return au
+	}
+
+	result := make([][]byte, 0, len(au)+3)
+	result = append(result, vps, sps, pps)
+	for _, nalu := range au {
+		if len(nalu) < 2 {
+			continue
+		}
+		nt := (nalu[0] >> 1) & 0x3F
+		if nt == 32 || nt == 33 || nt == 34 {
+			continue // Skip original VPS/SPS/PPS
+		}
+		result = append(result, nalu)
+	}
+	return result
 }
