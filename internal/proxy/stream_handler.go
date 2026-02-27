@@ -391,6 +391,11 @@ func (sh *StreamHandler) writeToStream(pkt *rtp.Packet) {
 	if stream == nil || desc == nil || len(desc.Medias) == 0 {
 		return
 	}
+
+	// Remap payload type to match our output format (96).
+	// The source camera may use a different dynamic PT.
+	pkt.PayloadType = 96
+
 	stream.WritePacketRTP(desc.Medias[0], pkt)
 }
 
