@@ -7,6 +7,7 @@ import (
 	"image/png"
 	"log/slog"
 	"os/exec"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,8 +73,12 @@ type StreamHandler struct {
 	fallbackMu     sync.Mutex
 	fallbackCancel context.CancelFunc
 
+	// Rate-limiting keyframe captures (unix seconds).
+	lastCaptureTS atomic.Int64
+
 	// Lifecycle
 	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // NewStreamHandler creates a handler for the given resolved camera config.
@@ -146,15 +151,20 @@ func (sh *StreamHandler) BuildDescription() *description.Session {
 // Start begins the connection/relay/fallback loop.
 func (sh *StreamHandler) Start(ctx context.Context) {
 	ctx, sh.cancel = context.WithCancel(ctx)
-	go sh.loop(ctx)
+	sh.wg.Add(1)
+	go func() {
+		defer sh.wg.Done()
+		sh.loop(ctx)
+	}()
 }
 
-// Stop terminates the handler and its fallback (if any).
+// Stop terminates the handler and waits for all goroutines to finish.
 func (sh *StreamHandler) Stop() {
-	sh.stopFallback()
 	if sh.cancel != nil {
 		sh.cancel()
 	}
+	sh.wg.Wait()
+	sh.stopFallback()
 }
 
 // -----------------------------------------------------------------------
@@ -224,6 +234,11 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 	}
 	defer c.Close()
 
+	// Bail out early if context was cancelled during connection.
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	desc, _, err := c.Describe(u)
 	if err != nil {
 		return fmt.Errorf("describe: %w", err)
@@ -240,8 +255,16 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 	sh.mu.Unlock()
 	sh.log.Info("codec detected", "codec", codec)
 
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	if _, err := c.Setup(desc.BaseURL, videoMedia, 0, 0); err != nil {
 		return fmt.Errorf("setup: %w", err)
+	}
+
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	// Packet arrival tracker.
@@ -251,7 +274,7 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 	)
 
 	// Register RTP callback.
-	sh.registerCallback(c, videoMedia, desc, &lastPktTime, &lastPktTimeMu)
+	sh.registerCallback(c, desc, &lastPktTime, &lastPktTimeMu)
 
 	if _, err := c.Play(nil); err != nil {
 		return fmt.Errorf("play: %w", err)
@@ -297,7 +320,6 @@ func (sh *StreamHandler) findVideoMedia(desc *description.Session) (*description
 
 func (sh *StreamHandler) registerCallback(
 	c *gortsplib.Client,
-	videoMedia *description.Media,
 	desc *description.Session,
 	lastPktTime *time.Time,
 	lastPktTimeMu *sync.Mutex,
@@ -309,11 +331,17 @@ func (sh *StreamHandler) registerCallback(
 	if desc.FindFormat(&h264f) != nil {
 		dec, _ := h264f.CreateDecoder()
 		c.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
+			defer func() {
+				if r := recover(); r != nil {
+					sh.log.Error("panic in RTP callback", "error", r, "stack", string(debug.Stack()))
+				}
+			}()
+
 			lastPktTimeMu.Lock()
 			*lastPktTime = time.Now()
 			lastPktTimeMu.Unlock()
 
-			sh.writeToStream(videoMedia, pkt)
+			sh.writeToStream(pkt)
 
 			if dec != nil {
 				if au, err := dec.Decode(pkt); err == nil {
@@ -324,11 +352,17 @@ func (sh *StreamHandler) registerCallback(
 	} else if desc.FindFormat(&h265f) != nil {
 		dec, _ := h265f.CreateDecoder()
 		c.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
+			defer func() {
+				if r := recover(); r != nil {
+					sh.log.Error("panic in RTP callback", "error", r, "stack", string(debug.Stack()))
+				}
+			}()
+
 			lastPktTimeMu.Lock()
 			*lastPktTime = time.Now()
 			lastPktTimeMu.Unlock()
 
-			sh.writeToStream(videoMedia, pkt)
+			sh.writeToStream(pkt)
 
 			if dec != nil {
 				if au, err := dec.Decode(pkt); err == nil {
@@ -339,14 +373,25 @@ func (sh *StreamHandler) registerCallback(
 	}
 }
 
-func (sh *StreamHandler) writeToStream(media *description.Media, pkt *rtp.Packet) {
+func (sh *StreamHandler) writeToStream(pkt *rtp.Packet) {
+	defer func() {
+		if r := recover(); r != nil {
+			sh.log.Error("panic writing RTP packet",
+				"error", r,
+				"stack", string(debug.Stack()),
+			)
+		}
+	}()
+
 	sh.mu.RLock()
 	stream := sh.stream
+	desc := sh.desc
 	sh.mu.RUnlock()
 
-	if stream != nil {
-		stream.WritePacketRTP(media, pkt)
+	if stream == nil || desc == nil || len(desc.Medias) == 0 {
+		return
 	}
+	stream.WritePacketRTP(desc.Medias[0], pkt)
 }
 
 // -----------------------------------------------------------------------
@@ -379,6 +424,13 @@ func (sh *StreamHandler) captureKeyframeH265(au [][]byte) {
 }
 
 func (sh *StreamHandler) decodeAndStore(nalus [][]byte, codec string) {
+	// Rate-limit: max one capture every 5 seconds to avoid FFmpeg storms.
+	now := time.Now().Unix()
+	if last := sh.lastCaptureTS.Load(); now-last < 5 {
+		return
+	}
+	sh.lastCaptureTS.Store(now)
+
 	// Build Annex-B stream.
 	var buf bytes.Buffer
 	for _, nalu := range nalus {
@@ -434,7 +486,11 @@ func (sh *StreamHandler) startFallback(ctx context.Context) {
 
 	fbCtx, cancel := context.WithCancel(ctx)
 	sh.fallbackCancel = cancel
-	go sh.runFallback(fbCtx)
+	sh.wg.Add(1)
+	go func() {
+		defer sh.wg.Done()
+		sh.runFallback(fbCtx)
+	}()
 }
 
 func (sh *StreamHandler) stopFallback() {
@@ -448,6 +504,12 @@ func (sh *StreamHandler) stopFallback() {
 }
 
 func (sh *StreamHandler) runFallback(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			sh.log.Error("panic in fallback loop", "error", r, "stack", string(debug.Stack()))
+		}
+	}()
+
 	codec := sh.GetCodec()
 	fps := sh.cfg.FallbackFPS
 	if fps <= 0 {
@@ -496,17 +558,6 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 			continue
 		}
 
-		sh.mu.RLock()
-		stream := sh.stream
-		desc := sh.desc
-		sh.mu.RUnlock()
-
-		if stream == nil || desc == nil || len(desc.Medias) == 0 {
-			continue
-		}
-
-		media := desc.Medias[0]
-
 		if codec == "h265" && h265Enc != nil {
 			pkts, err := h265Enc.Encode(nalus)
 			if err != nil {
@@ -514,7 +565,7 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 			}
 			for _, pkt := range pkts {
 				pkt.Timestamp = ts
-				stream.WritePacketRTP(media, pkt)
+				sh.writeToStream(pkt)
 			}
 		} else if h264Enc != nil {
 			pkts, err := h264Enc.Encode(nalus)
@@ -523,7 +574,7 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 			}
 			for _, pkt := range pkts {
 				pkt.Timestamp = ts
-				stream.WritePacketRTP(media, pkt)
+				sh.writeToStream(pkt)
 			}
 		}
 

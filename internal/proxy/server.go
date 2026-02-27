@@ -129,6 +129,7 @@ func (s *Server) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response
 	s.mu.RUnlock()
 
 	if !ok {
+		slog.Warn("setup: unknown stream", "path", name)
 		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil
 	}
 
