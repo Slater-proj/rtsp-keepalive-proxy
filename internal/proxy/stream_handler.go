@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"image/png"
 	"log/slog"
+	"os"
 	"os/exec"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,6 +75,11 @@ type StreamHandler struct {
 	fallbackMu     sync.Mutex
 	fallbackCancel context.CancelFunc
 
+	// Silent audio (PCMA) — keeps go2rtc/Frigate happy.
+	silenceMu     sync.Mutex
+	silenceCancel context.CancelFunc
+	silenceWg     sync.WaitGroup
+
 	// Rate-limiting keyframe captures (unix seconds).
 	lastCaptureTS atomic.Int64
 
@@ -92,7 +99,7 @@ func NewStreamHandler(name string, cfg config.ResolvedCamera) *StreamHandler {
 		Name:          name,
 		cfg:           cfg,
 		detectedCodec: codec,
-		fallbackGen:   fallback.NewGenerator(),
+		fallbackGen:   fallback.NewGenerator(name, cfg.FallbackMode),
 		log:           slog.With("camera", name),
 	}
 	sh.state.Store(int32(StateDisconnected))
@@ -128,6 +135,8 @@ func (sh *StreamHandler) SetStream(stream *gortsplib.ServerStream) {
 }
 
 // BuildDescription returns a session description matching the expected codec.
+// It advertises both a video track and a PCMA audio track so that consumers
+// like go2rtc / Frigate never complain about missing audio.
 func (sh *StreamHandler) BuildDescription() *description.Session {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -139,16 +148,30 @@ func (sh *StreamHandler) BuildDescription() *description.Session {
 		vf = &format.H264{PayloadTyp: 96, PacketizationMode: 1}
 	}
 
+	// PCMA (G.711 a-law) audio — static payload type 8.
+	af := &format.G711{
+		PayloadTyp:   8,
+		MULaw:        false, // a-law = PCMA
+		SampleRate:   8000,
+		ChannelCount: 1,
+	}
+
 	sh.desc = &description.Session{
-		Medias: []*description.Media{{
-			Type:    description.MediaTypeVideo,
-			Formats: []format.Format{vf},
-		}},
+		Medias: []*description.Media{
+			{
+				Type:    description.MediaTypeVideo,
+				Formats: []format.Format{vf},
+			},
+			{
+				Type:    description.MediaTypeAudio,
+				Formats: []format.Format{af},
+			},
+		},
 	}
 	return sh.desc
 }
 
-// Start begins the connection/relay/fallback loop.
+// Start begins the connection/relay/fallback loop and the silent audio generator.
 func (sh *StreamHandler) Start(ctx context.Context) {
 	ctx, sh.cancel = context.WithCancel(ctx)
 	sh.wg.Add(1)
@@ -156,6 +179,7 @@ func (sh *StreamHandler) Start(ctx context.Context) {
 		defer sh.wg.Done()
 		sh.loop(ctx)
 	}()
+	sh.startSilenceAudio(ctx)
 }
 
 // Stop terminates the handler and waits for all goroutines to finish.
@@ -165,6 +189,7 @@ func (sh *StreamHandler) Stop() {
 	}
 	sh.wg.Wait()
 	sh.stopFallback()
+	sh.stopSilenceAudio()
 }
 
 // -----------------------------------------------------------------------
@@ -196,7 +221,7 @@ func (sh *StreamHandler) loop(ctx context.Context) {
 		if err != nil {
 			sh.log.Warn("relay ended", "error", err)
 
-			if sh.cfg.BatteryMode {
+			if sh.cfg.BatteryMode && sh.cfg.FallbackMode != "none" {
 				sh.state.Store(int32(StateSleeping))
 				sh.startFallback(ctx)
 			} else {
@@ -399,6 +424,115 @@ func (sh *StreamHandler) writeToStream(pkt *rtp.Packet) {
 	stream.WritePacketRTP(desc.Medias[0], pkt)
 }
 
+// writeAudioToStream safely writes an audio RTP packet to the output server
+// stream (media index 1 = audio).
+func (sh *StreamHandler) writeAudioToStream(pkt *rtp.Packet) {
+	defer func() {
+		if r := recover(); r != nil {
+			sh.log.Error("panic writing audio RTP packet",
+				"error", r,
+				"stack", string(debug.Stack()),
+			)
+		}
+	}()
+
+	sh.mu.RLock()
+	stream := sh.stream
+	desc := sh.desc
+	sh.mu.RUnlock()
+
+	if stream == nil || desc == nil || len(desc.Medias) < 2 {
+		return
+	}
+
+	stream.WritePacketRTP(desc.Medias[1], pkt)
+}
+
+// -----------------------------------------------------------------------
+// Silent audio (PCMA) — continuous G.711 a-law silence so go2rtc is happy
+// -----------------------------------------------------------------------
+
+func (sh *StreamHandler) startSilenceAudio(ctx context.Context) {
+	sh.silenceMu.Lock()
+	defer sh.silenceMu.Unlock()
+
+	if sh.silenceCancel != nil {
+		return
+	}
+
+	silCtx, cancel := context.WithCancel(ctx)
+	sh.silenceCancel = cancel
+	sh.silenceWg.Add(1)
+	go func() {
+		defer sh.silenceWg.Done()
+		sh.runSilenceAudio(silCtx)
+	}()
+}
+
+func (sh *StreamHandler) stopSilenceAudio() {
+	sh.silenceMu.Lock()
+	defer sh.silenceMu.Unlock()
+
+	if sh.silenceCancel != nil {
+		sh.silenceCancel()
+		sh.silenceCancel = nil
+	}
+	sh.silenceWg.Wait()
+}
+
+func (sh *StreamHandler) runSilenceAudio(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			sh.log.Error("panic in silence audio", "error", r, "stack", string(debug.Stack()))
+		}
+	}()
+
+	// PCMA 8 kHz, 20 ms packets → 160 samples/packet.
+	const (
+		sampleRate       = 8000
+		packetDurationMs = 20
+		samplesPerPacket = sampleRate * packetDurationMs / 1000 // 160
+	)
+
+	// G.711 a-law silence byte.
+	silence := make([]byte, samplesPerPacket)
+	for i := range silence {
+		silence[i] = 0xD5
+	}
+
+	ticker := time.NewTicker(time.Duration(packetDurationMs) * time.Millisecond)
+	defer ticker.Stop()
+
+	var seq uint16
+	var ts uint32
+
+	sh.log.Debug("silence audio started")
+
+	for {
+		select {
+		case <-ctx.Done():
+			sh.log.Debug("silence audio stopped")
+			return
+		case <-ticker.C:
+		}
+
+		pkt := &rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    8, // PCMA
+				SequenceNumber: seq,
+				Timestamp:      ts,
+				SSRC:           0xDEADABCD,
+			},
+			Payload: silence,
+		}
+		sh.writeAudioToStream(pkt)
+
+		seq++
+		ts += samplesPerPacket
+	}
+}
+
 // -----------------------------------------------------------------------
 // Keyframe capture (for fallback image)
 // -----------------------------------------------------------------------
@@ -518,29 +652,124 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 	codec := sh.GetCodec()
 	fps := sh.cfg.FallbackFPS
 	if fps <= 0 {
-		fps = 1
+		fps = 5
 	}
 
-	interval := time.Second / time.Duration(fps)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	// Get fallback PNG from the generator.
+	pngData, w, h := sh.fallbackGen.GetFramePNG()
+	if len(pngData) == 0 {
+		sh.log.Error("no fallback frame available")
+		return
+	}
 
-	sh.log.Info("fallback stream started", "codec", codec, "fps", fps)
+	// H.264/H.265 require even dimensions.
+	if w%2 != 0 {
+		w++
+	}
+	if h%2 != 0 {
+		h++
+	}
 
-	// Prepare RTP encoder.
+	// Write PNG to a temp file for FFmpeg to loop.
+	tmpFile, err := os.CreateTemp("", fmt.Sprintf("fallback-%s-*.png", sh.Name))
+	if err != nil {
+		sh.log.Error("fallback: create temp file", "error", err)
+		return
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmpFile.Write(pngData); err != nil {
+		tmpFile.Close()
+		sh.log.Error("fallback: write temp file", "error", err)
+		return
+	}
+	tmpFile.Close()
+
+	// Build FFmpeg command for continuous H.264/H.265 output.
+	encoder := "libx264"
+	outFmt := "h264"
+	var encoderArgs []string
+
+	fpsStr := strconv.Itoa(fps)
+
+	switch codec {
+	case "h265":
+		encoder = "libx265"
+		outFmt = "hevc"
+		encoderArgs = []string{
+			"-preset", "ultrafast",
+			"-x265-params", fmt.Sprintf(
+				"keyint=%d:min-keyint=%d:scenecut=0:bframes=0:repeat-headers=1:log-level=error",
+				fps, fps),
+		}
+	default:
+		encoderArgs = []string{
+			"-preset", "ultrafast",
+			"-tune", "stillimage",
+			"-profile:v", "baseline",
+			"-level", "3.1",
+			"-x264-params", fmt.Sprintf(
+				"keyint=%d:min-keyint=%d:scenecut=0:bframes=0:repeat-headers=1",
+				fps, fps),
+		}
+	}
+
+	args := []string{
+		"-hide_banner", "-loglevel", "error",
+		"-loop", "1",
+		"-i", tmpPath,
+		"-c:v", encoder,
+		"-r", fpsStr,
+	}
+	args = append(args, encoderArgs...)
+	args = append(args,
+		"-s", fmt.Sprintf("%dx%d", w, h),
+		"-pix_fmt", "yuv420p",
+		"-f", outFmt,
+		"pipe:1",
+	)
+
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		sh.log.Error("fallback: stdout pipe", "error", err)
+		return
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		sh.log.Error("fallback: FFmpeg start", "error", err)
+		return
+	}
+	defer func() {
+		cmd.Process.Kill()
+		cmd.Wait()
+		if stderr.Len() > 0 {
+			sh.log.Debug("fallback FFmpeg stderr", "output", stderr.String())
+		}
+	}()
+
+	sh.log.Info("fallback stream started",
+		"codec", codec, "fps", fps,
+		"size", fmt.Sprintf("%dx%d", w, h))
+
+	// RTP encoder.
 	var h264Enc *rtph264.Encoder
 	var h265Enc *rtph265.Encoder
 
 	if codec == "h265" {
 		h265Enc = &rtph265.Encoder{PayloadType: 96, PayloadMaxSize: 1200}
 		if err := h265Enc.Init(); err != nil {
-			sh.log.Error("h265 encoder init failed", "error", err)
+			sh.log.Error("h265 RTP encoder init", "error", err)
 			return
 		}
 	} else {
 		h264Enc = &rtph264.Encoder{PayloadType: 96, PayloadMaxSize: 1200}
 		if err := h264Enc.Init(); err != nil {
-			sh.log.Error("h264 encoder init failed", "error", err)
+			sh.log.Error("h264 RTP encoder init", "error", err)
 			return
 		}
 	}
@@ -548,6 +777,33 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 	clockRate := uint32(90000)
 	tsInc := clockRate / uint32(fps)
 	var ts uint32
+
+	// Goroutine: parse continuous Annex-B stream into access units.
+	auCh := make(chan [][]byte, 1)
+	go func() {
+		defer close(auCh)
+		isVCL := fallback.IsH264VCL
+		if codec == "h265" {
+			isVCL = fallback.IsH265VCL
+		}
+		nalCh := fallback.StreamNALUs(stdout)
+		var au [][]byte
+		for nalu := range nalCh {
+			au = append(au, nalu)
+			if isVCL(nalu) {
+				select {
+				case auCh <- au:
+				case <-ctx.Done():
+					return
+				}
+				au = nil
+			}
+		}
+	}()
+
+	// Emit access units at the configured FPS.
+	ticker := time.NewTicker(time.Second / time.Duration(fps))
+	defer ticker.Stop()
 
 	for {
 		select {
@@ -557,32 +813,31 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		case <-ticker.C:
 		}
 
-		nalus, err := sh.fallbackGen.GenerateNALUs(codec)
-		if err != nil {
-			sh.log.Error("fallback frame generation failed", "error", err)
-			continue
+		select {
+		case au, ok := <-auCh:
+			if !ok {
+				sh.log.Info("fallback stream ended (FFmpeg exited)")
+				return
+			}
+			if codec == "h265" && h265Enc != nil {
+				if pkts, err := h265Enc.Encode(au); err == nil {
+					for _, pkt := range pkts {
+						pkt.Timestamp = ts
+						sh.writeToStream(pkt)
+					}
+				}
+			} else if h264Enc != nil {
+				if pkts, err := h264Enc.Encode(au); err == nil {
+					for _, pkt := range pkts {
+						pkt.Timestamp = ts
+						sh.writeToStream(pkt)
+					}
+				}
+			}
+			ts += tsInc
+		case <-ctx.Done():
+			sh.log.Info("fallback stream stopped")
+			return
 		}
-
-		if codec == "h265" && h265Enc != nil {
-			pkts, err := h265Enc.Encode(nalus)
-			if err != nil {
-				continue
-			}
-			for _, pkt := range pkts {
-				pkt.Timestamp = ts
-				sh.writeToStream(pkt)
-			}
-		} else if h264Enc != nil {
-			pkts, err := h264Enc.Encode(nalus)
-			if err != nil {
-				continue
-			}
-			for _, pkt := range pkts {
-				pkt.Timestamp = ts
-				sh.writeToStream(pkt)
-			}
-		}
-
-		ts += tsInc
 	}
 }

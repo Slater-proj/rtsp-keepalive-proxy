@@ -15,7 +15,12 @@ defaults:
   # Duration without packets before camera is considered asleep
   timeout: 10s
   # FPS of the fallback still-image stream
-  fallback_fps: 1
+  fallback_fps: 5
+  # What to show when camera sleeps:
+  #   offline    — dark frame with "OFFLINE – <camera>" overlay (default)
+  #   last_frame — last captured keyframe from the camera
+  #   none       — no fallback stream (Frigate sees a disconnect)
+  fallback_mode: offline
   # Codec: auto (detect from source), h264, h265
   codec: auto
 
@@ -28,7 +33,7 @@ cameras:
     battery_mode: true
     retry_interval: 3s
     timeout: 10s
-    fallback_fps: 1
+    fallback_fps: 5
 
   entree:
     source: "rtsp://${CAM_USER}:${CAM_PASS_ENTREE}@192.168.1.52:554/cam/realmonitor?channel=1&subtype=0"
@@ -36,4 +41,4 @@ cameras:
     battery_mode: true
     retry_interval: 3s
     timeout: 10s
-    fallback_fps: 1
+    fallback_fps: 5

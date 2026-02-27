@@ -15,15 +15,17 @@ Camera (intermittent) → rtsp-keepalive-proxy (always-on) → Frigate (happy)
 ```
 
 When a camera is **streaming**: packets are relayed transparently with zero added latency.  
-When a camera **sleeps**: the proxy generates a continuous still-image stream (last captured keyframe) so Frigate never sees a disconnection.
+When a camera **sleeps**: the proxy generates a continuous fallback stream so Frigate never sees a disconnection.  
+Fallback behaviour is configurable per camera: **offline overlay**, **last captured frame**, or **disabled**.
 
 ### Features
 
 - **H.264 & H.265 (HEVC)** — auto-detects codec from camera SDP
 - **Multi-camera** — one container handles all your battery cameras
 - **Instant switchover** — fallback stream starts within one retry interval
-- **Keyframe capture** — stores last IDR frame for realistic fallback image
-- **Per-camera config** — override battery mode, timeouts, FPS individually
+- **Configurable fallback** — `offline` overlay, `last_frame`, or `none` (per camera)
+- **Keyframe capture** — stores last IDR frame for `last_frame` mode
+- **Per-camera config** — override battery mode, timeouts, FPS, fallback individually
 - **Low + high quality** — `source_low` auto-creates a `low_<name>` output path
 - **Health & status API** — HTTP endpoints for monitoring
 - **Tiny footprint** — ~30 MB Docker image (Alpine + Go binary + FFmpeg)
@@ -82,7 +84,8 @@ defaults:
   battery_mode: true      # Enable sleep detection + fallback
   retry_interval: 3s      # Time between reconnection attempts
   timeout: 10s            # No-packet duration before declaring sleep
-  fallback_fps: 1         # FPS of the still-image fallback stream
+  fallback_fps: 5         # FPS of the still-image fallback stream
+  fallback_mode: offline  # offline | last_frame | none
   codec: auto             # auto | h264 | h265
 
 cameras:
@@ -94,6 +97,7 @@ cameras:
     retry_interval: 3s
     timeout: 10s
     fallback_fps: 1
+    fallback_mode: offline  # override per camera
     codec: auto
 ```
 

@@ -81,8 +81,11 @@ cameras:
 	if cfg.Defaults.Timeout != 10*time.Second {
 		t.Errorf("default Timeout = %v, want 10s", cfg.Defaults.Timeout)
 	}
-	if cfg.Defaults.FallbackFPS != 1 {
-		t.Errorf("default FallbackFPS = %d, want 1", cfg.Defaults.FallbackFPS)
+	if cfg.Defaults.FallbackFPS != 5 {
+		t.Errorf("default FallbackFPS = %d, want 5", cfg.Defaults.FallbackFPS)
+	}
+	if cfg.Defaults.FallbackMode != "offline" {
+		t.Errorf("default FallbackMode = %q, want offline", cfg.Defaults.FallbackMode)
 	}
 	if cfg.Defaults.Codec != "auto" {
 		t.Errorf("default Codec = %q, want auto", cfg.Defaults.Codec)
@@ -118,6 +121,7 @@ func TestEffectiveDefaults(t *testing.T) {
 		RetryInterval: 5 * time.Second,
 		Timeout:       15 * time.Second,
 		FallbackFPS:   2,
+		FallbackMode:  "offline",
 		Codec:         "h264",
 	}
 
@@ -138,6 +142,9 @@ func TestEffectiveDefaults(t *testing.T) {
 	if r.Codec != "h264" {
 		t.Errorf("Codec = %q, want h264", r.Codec)
 	}
+	if r.FallbackMode != "offline" {
+		t.Errorf("FallbackMode = %q, want offline", r.FallbackMode)
+	}
 }
 
 func TestEffectiveOverrides(t *testing.T) {
@@ -146,12 +153,14 @@ func TestEffectiveOverrides(t *testing.T) {
 		RetryInterval: 5 * time.Second,
 		Timeout:       15 * time.Second,
 		FallbackFPS:   2,
+		FallbackMode:  "offline",
 		Codec:         "h264",
 	}
 
 	bm := false
 	ri := 10 * time.Second
 	fps := 5
+	fmode := "last_frame"
 	codec := "h265"
 
 	cam := CameraConfig{
@@ -159,6 +168,7 @@ func TestEffectiveOverrides(t *testing.T) {
 		BatteryMode:   &bm,
 		RetryInterval: &ri,
 		FallbackFPS:   &fps,
+		FallbackMode:  &fmode,
 		Codec:         &codec,
 	}
 
@@ -175,8 +185,38 @@ func TestEffectiveOverrides(t *testing.T) {
 	if r.Codec != "h265" {
 		t.Errorf("Codec = %q, want h265", r.Codec)
 	}
+	if r.FallbackMode != "last_frame" {
+		t.Errorf("FallbackMode = %q, want last_frame", r.FallbackMode)
+	}
 	// Timeout should come from defaults since not overridden
 	if r.Timeout != 15*time.Second {
 		t.Errorf("Timeout = %v, want 15s", r.Timeout)
+	}
+}
+
+func TestInvalidFallbackMode(t *testing.T) {
+	yaml := `
+defaults:
+  fallback_mode: invalid
+cameras:
+  c1:
+    source: "rtsp://localhost/test"
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for invalid fallback_mode")
+	}
+}
+
+func TestInvalidCameraFallbackMode(t *testing.T) {
+	yaml := `
+cameras:
+  c1:
+    source: "rtsp://localhost/test"
+    fallback_mode: bad
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for invalid per-camera fallback_mode")
 	}
 }

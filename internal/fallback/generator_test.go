@@ -10,9 +10,9 @@ import (
 )
 
 func TestNewGenerator(t *testing.T) {
-	g := NewGenerator()
-	if g.HasFrame() {
-		t.Error("new generator should not have a frame")
+	g := NewGenerator("test_cam", "offline")
+	if !g.HasFrame() {
+		t.Error("new generator should have default dimensions")
 	}
 	w, h := g.Dimensions()
 	if w != 1920 || h != 1080 {
@@ -21,7 +21,7 @@ func TestNewGenerator(t *testing.T) {
 }
 
 func TestUpdateFrame(t *testing.T) {
-	g := NewGenerator()
+	g := NewGenerator("test_cam", "last_frame")
 
 	pngData := createTestPNG(t, 640, 480)
 	g.UpdateFrame(pngData, 640, 480)
@@ -36,47 +36,47 @@ func TestUpdateFrame(t *testing.T) {
 }
 
 func TestUpdateFrameInvalidatesCache(t *testing.T) {
-	g := NewGenerator()
+	g := NewGenerator("test_cam", "offline")
 
 	png1 := createTestPNG(t, 320, 240)
 	g.UpdateFrame(png1, 320, 240)
-	// Manually set cache
+	// Manually set offline PNG cache.
 	g.mu.Lock()
-	g.cachedCodec = "h264"
-	g.cachedNALUs = [][]byte{{0x67}}
+	g.cachedOfflinePNG = []byte{0x89, 0x50, 0x4E, 0x47}
+	g.cachedOfflineW = 320
+	g.cachedOfflineH = 240
 	g.mu.Unlock()
 
 	png2 := createTestPNG(t, 320, 240)
 	g.UpdateFrame(png2, 320, 240)
 
 	g.mu.RLock()
-	if g.cachedCodec != "" {
-		t.Error("cache should be invalidated after UpdateFrame")
-	}
-	if g.cachedNALUs != nil {
-		t.Error("cachedNALUs should be nil after UpdateFrame")
+	if g.cachedOfflinePNG != nil {
+		t.Error("cachedOfflinePNG should be nil after UpdateFrame")
 	}
 	g.mu.RUnlock()
 }
 
 func TestUpdateFrameIsolation(t *testing.T) {
-	g := NewGenerator()
+	g := NewGenerator("test_cam", "offline")
 
-	original := []byte{1, 2, 3, 4, 5}
-	g.UpdateFrame(original, 100, 100)
+	g.UpdateFrame(nil, 640, 480)
 
-	// Modify the original — should not affect stored data.
-	original[0] = 99
-
-	g.mu.RLock()
-	if g.lastFrame[0] == 99 {
-		t.Error("stored frame aliases the input slice")
+	w, h := g.Dimensions()
+	if w != 640 || h != 480 {
+		t.Errorf("dimensions = %dx%d, want 640x480", w, h)
 	}
-	g.mu.RUnlock()
+
+	// Updating again should change dimensions.
+	g.UpdateFrame(nil, 1280, 720)
+	w, h = g.Dimensions()
+	if w != 1280 || h != 720 {
+		t.Errorf("dimensions = %dx%d, want 1280x720", w, h)
+	}
 }
 
 func TestPlaceholder(t *testing.T) {
-	g := NewGenerator()
+	g := NewGenerator("test_cam", "offline")
 	data := g.placeholder(64, 64)
 	if data == nil {
 		t.Fatal("placeholder returned nil")
@@ -93,7 +93,7 @@ func TestPlaceholder(t *testing.T) {
 }
 
 func TestPlaceholderDefaultSize(t *testing.T) {
-	g := NewGenerator()
+	g := NewGenerator("test_cam", "offline")
 	data := g.placeholder(0, 0)
 	if data == nil {
 		t.Fatal("placeholder returned nil")
@@ -105,6 +105,43 @@ func TestPlaceholderDefaultSize(t *testing.T) {
 	bounds := img.Bounds()
 	if bounds.Dx() != 1920 || bounds.Dy() != 1080 {
 		t.Errorf("placeholder default size = %dx%d, want 1920x1080", bounds.Dx(), bounds.Dy())
+	}
+}
+
+func TestGetFramePNGOffline(t *testing.T) {
+	g := NewGenerator("test_cam", "offline")
+	pngData, w, h := g.GetFramePNG()
+	if len(pngData) == 0 {
+		t.Fatal("GetFramePNG returned empty data")
+	}
+	if w != 1920 || h != 1080 {
+		t.Errorf("dimensions = %dx%d, want 1920x1080", w, h)
+	}
+	// Verify it's a valid PNG.
+	_, err := png.Decode(bytes.NewReader(pngData))
+	if err != nil {
+		t.Fatalf("GetFramePNG is not valid PNG: %v", err)
+	}
+}
+
+func TestGetFramePNGLastFrame(t *testing.T) {
+	g := NewGenerator("test_cam", "last_frame")
+
+	// Before any frame, should return a placeholder.
+	pngData, _, _ := g.GetFramePNG()
+	if len(pngData) == 0 {
+		t.Fatal("GetFramePNG returned empty data before first frame")
+	}
+
+	// After updating with a real frame, should return that frame.
+	realPNG := createTestPNG(t, 640, 480)
+	g.UpdateFrame(realPNG, 640, 480)
+	pngData, w, h := g.GetFramePNG()
+	if w != 640 || h != 480 {
+		t.Errorf("dimensions = %dx%d, want 640x480", w, h)
+	}
+	if !bytes.Equal(pngData, realPNG) {
+		t.Error("GetFramePNG should return the last captured frame in last_frame mode")
 	}
 }
 

@@ -11,8 +11,8 @@ services:
     volumes:
       - ./config.yaml:/etc/rtsp-proxy/config.yaml:ro
     ports:
-      - "8554:8554"   # RTSP output
-      - "8090:8080"   # Health / status (remapped to avoid conflict)
+      - "8554:8554" # RTSP output
+      - "8090:8080" # Health / status (remapped to avoid conflict)
     environment:
       - TZ=Europe/Paris
       # Camera credentials (referenced in config.yaml via ${VAR})

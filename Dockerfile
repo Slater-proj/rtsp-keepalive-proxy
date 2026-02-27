@@ -21,6 +21,7 @@ FROM alpine:3.20
 
 RUN apk add --no-cache \
       ffmpeg \
+      ttf-dejavu \
       tzdata \
       ca-certificates
 
@@ -33,7 +34,7 @@ EXPOSE 8554/tcp
 EXPOSE 8080/tcp
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD wget -qO- http://localhost:8080/health || exit 1
+      CMD wget -qO- http://localhost:8080/health || exit 1
 
 ENTRYPOINT ["rtsp-keepalive-proxy"]
 CMD ["-config", "/etc/rtsp-proxy/config.yaml"]

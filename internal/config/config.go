@@ -29,6 +29,7 @@ type CameraDefaults struct {
 	RetryInterval time.Duration `yaml:"retry_interval"`
 	Timeout       time.Duration `yaml:"timeout"`
 	FallbackFPS   int           `yaml:"fallback_fps"`
+	FallbackMode  string        `yaml:"fallback_mode"` // "offline", "last_frame", "none"
 	Codec         string        `yaml:"codec"`
 }
 
@@ -42,6 +43,7 @@ type CameraConfig struct {
 	RetryInterval *time.Duration `yaml:"retry_interval,omitempty"`
 	Timeout       *time.Duration `yaml:"timeout,omitempty"`
 	FallbackFPS   *int           `yaml:"fallback_fps,omitempty"`
+	FallbackMode  *string        `yaml:"fallback_mode,omitempty"` // "offline", "last_frame", "none"
 	Codec         *string        `yaml:"codec,omitempty"`
 }
 
@@ -54,6 +56,7 @@ func (c CameraConfig) Effective(d CameraDefaults) ResolvedCamera {
 		RetryInterval: d.RetryInterval,
 		Timeout:       d.Timeout,
 		FallbackFPS:   d.FallbackFPS,
+		FallbackMode:  d.FallbackMode,
 		Codec:         d.Codec,
 	}
 	if c.BatteryMode != nil {
@@ -67,6 +70,9 @@ func (c CameraConfig) Effective(d CameraDefaults) ResolvedCamera {
 	}
 	if c.FallbackFPS != nil {
 		r.FallbackFPS = *c.FallbackFPS
+	}
+	if c.FallbackMode != nil {
+		r.FallbackMode = *c.FallbackMode
 	}
 	if c.Codec != nil {
 		r.Codec = *c.Codec
@@ -82,6 +88,7 @@ type ResolvedCamera struct {
 	RetryInterval time.Duration
 	Timeout       time.Duration
 	FallbackFPS   int
+	FallbackMode  string // "offline", "last_frame", "none"
 	Codec         string
 }
 
@@ -133,7 +140,10 @@ func applyGlobalDefaults(d *CameraDefaults) {
 		d.Timeout = 10 * time.Second
 	}
 	if d.FallbackFPS == 0 {
-		d.FallbackFPS = 1
+		d.FallbackFPS = 5
+	}
+	if d.FallbackMode == "" {
+		d.FallbackMode = "offline"
 	}
 	if d.Codec == "" {
 		d.Codec = "auto"
@@ -144,9 +154,22 @@ func validate(cfg *Config) error {
 	if len(cfg.Cameras) == 0 {
 		return fmt.Errorf("config: no cameras defined")
 	}
+	switch cfg.Defaults.FallbackMode {
+	case "offline", "last_frame", "none":
+		// valid
+	default:
+		return fmt.Errorf("config: invalid default fallback_mode %q (must be offline, last_frame, or none)", cfg.Defaults.FallbackMode)
+	}
 	for name, cam := range cfg.Cameras {
 		if cam.Source == "" {
 			return fmt.Errorf("config: camera %q missing source URL", name)
+		}
+		if cam.FallbackMode != nil {
+			switch *cam.FallbackMode {
+			case "offline", "last_frame", "none":
+			default:
+				return fmt.Errorf("config: camera %q invalid fallback_mode %q", name, *cam.FallbackMode)
+			}
 		}
 	}
 	return nil
