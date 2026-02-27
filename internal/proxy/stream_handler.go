@@ -445,11 +445,15 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 		lastPktTimeMu sync.Mutex
 	)
 
-	// Stop fallback BEFORE relay to prevent concurrent writes.
-	sh.stopFallback()
-
-	// Reset the video timeline so the camera's timestamps map smoothly.
-	sh.resetVideoTimeline()
+	// DO NOT stop fallback here. Fallback keeps running and producing
+	// video frames until the camera sends its first IDR. The RTP callback
+	// in registerCallback performs a seamless, gap-free transition:
+	// stopFallback → resetTimeline → forward IDR.
+	//
+	// Previously we stopped fallback here, creating a dead period with
+	// NO video output until the first camera IDR. During that gap,
+	// go2rtc / Frigate FFmpeg would fail with "Could not find codec
+	// parameters" or produce garbage frames.
 
 	// Register RTP callback with decode+re-encode.
 	sh.registerCallback(c, srcDesc, &lastPktTime, &lastPktTimeMu)
@@ -572,8 +576,13 @@ func (sh *StreamHandler) registerCallback(
 				if !hasIDR {
 					return
 				}
+				// Seamless transition: stop fallback and reset timeline
+				// immediately before forwarding the first camera IDR.
+				// This ensures zero gap in the output stream.
+				sh.stopFallback()
+				sh.resetVideoTimeline()
 				seenIDR = true
-				sh.log.Info("first IDR received, camera relay starting")
+				sh.log.Info("first IDR received, seamless transition to camera")
 			}
 
 			// Track in-band SPS/PPS updates from the camera.
@@ -665,8 +674,10 @@ func (sh *StreamHandler) registerCallback(
 				if !hasIRAP {
 					return
 				}
+				sh.stopFallback()
+				sh.resetVideoTimeline()
 				seenIRAP = true
-				sh.log.Info("first IRAP received, camera relay starting")
+				sh.log.Info("first IRAP received, seamless transition to camera")
 			}
 
 			// Track in-band VPS/SPS/PPS.
