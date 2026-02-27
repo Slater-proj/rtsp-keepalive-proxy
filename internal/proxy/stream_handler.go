@@ -83,6 +83,12 @@ type StreamHandler struct {
 	// Rate-limiting keyframe captures (unix seconds).
 	lastCaptureTS atomic.Int64
 
+	// Pre-generated SPS/PPS for the initial SDP.
+	// Without these in the SDP, Frigate's FFmpeg (analyzeduration=0)
+	// cannot determine video dimensions and fails.
+	initialSPS []byte
+	initialPPS []byte
+
 	// Lifecycle
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -103,7 +109,101 @@ func NewStreamHandler(name string, cfg config.ResolvedCamera) *StreamHandler {
 		log:           slog.With("camera", name),
 	}
 	sh.state.Store(int32(StateDisconnected))
+
+	// Pre-generate SPS/PPS so the SDP always has sprop-parameter-sets.
+	// This is critical: Frigate sets analyzeduration=0 (no probing),
+	// so without SPS/PPS in the SDP, FFmpeg can't determine dimensions
+	// and its decoder misinterprets NAL data.
+	if codec == "h264" && cfg.FallbackMode != "none" {
+		sh.preGenerateSPSPPS()
+	}
+
 	return sh
+}
+
+// preGenerateSPSPPS runs FFmpeg synchronously to encode one placeholder
+// frame, extracting H.264 SPS/PPS NAL units. These are embedded into
+// the SDP (sprop-parameter-sets) so consumers with analyzeduration=0
+// can determine video dimensions without probing the RTP stream.
+func (sh *StreamHandler) preGenerateSPSPPS() {
+	pngData, w, h := sh.fallbackGen.GetFramePNG()
+	if len(pngData) == 0 {
+		sh.log.Warn("preGenerateSPSPPS: no PNG available, SDP will lack sprop-parameter-sets")
+		return
+	}
+
+	if w%2 != 0 {
+		w++
+	}
+	if h%2 != 0 {
+		h++
+	}
+
+	tmpFile, err := os.CreateTemp("", fmt.Sprintf("init-sps-%s-*.png", sh.Name))
+	if err != nil {
+		sh.log.Warn("preGenerateSPSPPS: temp file", "error", err)
+		return
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmpFile.Write(pngData); err != nil {
+		tmpFile.Close()
+		sh.log.Warn("preGenerateSPSPPS: write temp file", "error", err)
+		return
+	}
+	tmpFile.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-hide_banner", "-loglevel", "error",
+		"-i", tmpPath,
+		"-c:v", "libx264",
+		"-frames:v", "1",
+		"-preset", "ultrafast",
+		"-profile:v", "baseline",
+		"-level", "3.1",
+		"-x264-params", "keyint=1:min-keyint=1:scenecut=0:bframes=0:repeat-headers=1",
+		"-s", fmt.Sprintf("%dx%d", w, h),
+		"-pix_fmt", "yuv420p",
+		"-f", "h264",
+		"pipe:1",
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	output, err := cmd.Output()
+	if err != nil {
+		sh.log.Warn("preGenerateSPSPPS: FFmpeg failed",
+			"error", err, "stderr", stderr.String())
+		return
+	}
+
+	nalus := fallback.ParseAnnexB(output)
+	for _, nalu := range nalus {
+		if len(nalu) == 0 {
+			continue
+		}
+		switch nalu[0] & 0x1F {
+		case 7: // SPS
+			sh.initialSPS = make([]byte, len(nalu))
+			copy(sh.initialSPS, nalu)
+		case 8: // PPS
+			sh.initialPPS = make([]byte, len(nalu))
+			copy(sh.initialPPS, nalu)
+		}
+	}
+
+	if sh.initialSPS != nil && sh.initialPPS != nil {
+		sh.log.Info("pre-generated SPS/PPS for SDP",
+			"sps_size", len(sh.initialSPS),
+			"pps_size", len(sh.initialPPS),
+			"frame", fmt.Sprintf("%dx%d", w, h))
+	} else {
+		sh.log.Warn("preGenerateSPSPPS: could not extract SPS/PPS from FFmpeg output")
+	}
 }
 
 // GetState returns the current camera state.
@@ -145,7 +245,12 @@ func (sh *StreamHandler) BuildDescription() *description.Session {
 	if sh.detectedCodec == "h265" {
 		vf = &format.H265{PayloadTyp: 96}
 	} else {
-		vf = &format.H264{PayloadTyp: 96, PacketizationMode: 1}
+		vf = &format.H264{
+			PayloadTyp:        96,
+			PacketizationMode: 1,
+			SPS:               sh.initialSPS,
+			PPS:               sh.initialPPS,
+		}
 	}
 
 	// PCMA (G.711 a-law) audio — static payload type 8.
