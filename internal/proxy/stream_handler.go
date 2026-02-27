@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
 	"image/png"
 	"log/slog"
 	"os"
@@ -526,6 +529,8 @@ func (sh *StreamHandler) registerCallback(
 			return
 		}
 
+		seenIDR := false
+
 		c.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
 			defer func() {
 				if r := recover(); r != nil {
@@ -537,28 +542,38 @@ func (sh *StreamHandler) registerCallback(
 			*lastPktTime = time.Now()
 			lastPktTimeMu.Unlock()
 
-			// Decode: reassemble the camera's RTP packets into a
-			// complete H.264 access unit (list of NAL units).
-			// Returns nil if the AU is not yet complete (e.g. FU-A).
 			au, err := dec.Decode(pkt)
 			if err != nil || au == nil {
 				return
 			}
 
-			// Capture keyframe for fallback image.
+			// Wait for the first IDR before forwarding anything.
+			// The first AUs after RTSP PLAY may be incomplete
+			// (joined mid-GOP), producing garbage NAL types that
+			// trigger "data partitioning is not implemented".
+			if !seenIDR {
+				hasIDR := false
+				for _, nalu := range au {
+					if len(nalu) > 0 && (nalu[0]&0x1F) == 5 {
+						hasIDR = true
+						break
+					}
+				}
+				if !hasIDR {
+					return
+				}
+				seenIDR = true
+				sh.log.Info("first IDR received, camera relay starting")
+			}
+
 			sh.captureKeyframeH264(au)
 
-			// Re-encode through OUR encoder. This produces RTP packets
-			// with correct STAP-A / FU-A / single-NALU boundaries
-			// matching PacketizationMode=1.
 			outPkts, err := enc.Encode(au)
 			if err != nil {
 				sh.log.Debug("H264 re-encode error", "error", err)
 				return
 			}
 
-			// Carry the source timestamp so the output timeline is
-			// based on the camera's clock (normalised by writeToStream).
 			for _, outPkt := range outPkts {
 				outPkt.Timestamp = pkt.Timestamp
 				sh.writeToStream(outPkt)
@@ -581,6 +596,8 @@ func (sh *StreamHandler) registerCallback(
 			return
 		}
 
+		seenIRAP := false
+
 		c.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
 			defer func() {
 				if r := recover(); r != nil {
@@ -595,6 +612,24 @@ func (sh *StreamHandler) registerCallback(
 			au, err := dec.Decode(pkt)
 			if err != nil || au == nil {
 				return
+			}
+
+			if !seenIRAP {
+				hasIRAP := false
+				for _, nalu := range au {
+					if len(nalu) >= 2 {
+						nt := (nalu[0] >> 1) & 0x3F
+						if nt >= 16 && nt <= 21 {
+							hasIRAP = true
+							break
+						}
+					}
+				}
+				if !hasIRAP {
+					return
+				}
+				seenIRAP = true
+				sh.log.Info("first IRAP received, camera relay starting")
 			}
 
 			sh.captureKeyframeH265(au)
@@ -1027,26 +1062,145 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		h++
 	}
 
-	tmpFile, err := os.CreateTemp("", fmt.Sprintf("fallback-%s-*.png", sh.Name))
-	if err != nil {
-		sh.log.Error("fallback: create temp file", "error", err)
+	// Encode base frame.
+	baseAU, sps, pps := sh.encodePNGToAU(pngData, w, h, codec)
+	if len(baseAU) == 0 {
+		sh.log.Error("fallback: no NAL units from base frame")
 		return
+	}
+
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Build frame variants: base frame + dot-indicator frame for animation.
+	// The indicator is a tiny (6x6 px) dot in the bottom-right corner,
+	// far too small to trigger motion detection but visible to humans
+	// as proof the stream is alive.
+	frameVariants := [][][]byte{baseAU}
+
+	dotPng := addIndicatorDot(pngData)
+	if dotPng != nil {
+		dotAU, _, _ := sh.encodePNGToAU(dotPng, w, h, codec)
+		if len(dotAU) > 0 {
+			frameVariants = append(frameVariants, dotAU)
+		}
+	}
+
+	// Update SDP with SPS/PPS.
+	if codec == "h264" && sps != nil && pps != nil {
+		sh.mu.Lock()
+		if sh.desc != nil && len(sh.desc.Medias) > 0 {
+			if h264Fmt, ok := sh.desc.Medias[0].Formats[0].(*format.H264); ok {
+				h264Fmt.SPS = sps
+				h264Fmt.PPS = pps
+			}
+		}
+		sh.mu.Unlock()
+		sh.log.Info("fallback: updated SPS/PPS in SDP",
+			"sps_size", len(sps), "pps_size", len(pps))
+	}
+
+	// Set up RTP encoder.
+	var h264Enc *rtph264.Encoder
+	var h265Enc *rtph265.Encoder
+
+	if codec == "h265" {
+		h265Enc = &rtph265.Encoder{PayloadType: 96, PayloadMaxSize: 1200}
+		if err := h265Enc.Init(); err != nil {
+			sh.log.Error("h265 RTP encoder init", "error", err)
+			return
+		}
+	} else {
+		h264Enc = &rtph264.Encoder{
+			PayloadType:       96,
+			PayloadMaxSize:    1200,
+			PacketizationMode: 1,
+		}
+		if err := h264Enc.Init(); err != nil {
+			sh.log.Error("h264 RTP encoder init", "error", err)
+			return
+		}
+	}
+
+	clockRate := uint32(90000)
+	tsInc := clockRate / uint32(fps)
+	var ts uint32
+
+	// Animation: alternate between frame variants every ~1 second.
+	variantIdx := 0
+	switchEvery := fps
+	if switchEvery < 1 {
+		switchEvery = 1
+	}
+	tickCount := 0
+
+	sh.log.Info("fallback stream started",
+		"codec", codec, "fps", fps,
+		"size", fmt.Sprintf("%dx%d", w, h),
+		"variants", len(frameVariants))
+
+	ticker := time.NewTicker(time.Second / time.Duration(fps))
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			sh.log.Info("fallback stream stopped")
+			return
+		case <-ticker.C:
+		}
+
+		au := frameVariants[variantIdx]
+
+		if codec == "h265" && h265Enc != nil {
+			pkts, err := h265Enc.Encode(au)
+			if err != nil {
+				sh.log.Error("fallback: H265 encode", "error", err)
+				continue
+			}
+			for _, pkt := range pkts {
+				pkt.Timestamp = ts
+				sh.writeToStream(pkt)
+			}
+		} else if h264Enc != nil {
+			pkts, err := h264Enc.Encode(au)
+			if err != nil {
+				sh.log.Error("fallback: H264 encode", "error", err)
+				continue
+			}
+			for _, pkt := range pkts {
+				pkt.Timestamp = ts
+				sh.writeToStream(pkt)
+			}
+		}
+
+		ts += tsInc
+		tickCount++
+		if tickCount >= switchEvery {
+			tickCount = 0
+			variantIdx = (variantIdx + 1) % len(frameVariants)
+		}
+	}
+}
+
+// encodePNGToAU encodes PNG data to H.264/H.265 NAL units via FFmpeg.
+// Returns the filtered access unit, plus SPS and PPS (H.264 only).
+func (sh *StreamHandler) encodePNGToAU(pngData []byte, w, h int, codec string) (au [][]byte, sps, pps []byte) {
+	tmpFile, err := os.CreateTemp("", fmt.Sprintf("fb-enc-%s-*.png", sh.Name))
+	if err != nil {
+		sh.log.Error("encodePNGToAU: temp file", "error", err)
+		return nil, nil, nil
 	}
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 
 	if _, err := tmpFile.Write(pngData); err != nil {
 		tmpFile.Close()
-		sh.log.Error("fallback: write temp file", "error", err)
-		return
+		return nil, nil, nil
 	}
 	tmpFile.Close()
 
-	if ctx.Err() != nil {
-		return
-	}
-
-	// Encode ONE IDR frame with FFmpeg, then re-emit at FPS.
 	encCodec := "libx264"
 	outFmt := "h264"
 	var encoderArgs []string
@@ -1082,142 +1236,72 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		"pipe:1",
 	)
 
-	encCtx, encCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer encCancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	cmd := exec.CommandContext(encCtx, "ffmpeg", args...)
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	output, err := cmd.Output()
 	if err != nil {
-		sh.log.Error("fallback: FFmpeg encode failed",
+		sh.log.Error("encodePNGToAU: FFmpeg failed",
 			"error", err, "stderr", stderr.String())
-		return
+		return nil, nil, nil
 	}
 
-	au := fallback.ParseAnnexB(output)
-	if len(au) == 0 {
-		sh.log.Error("fallback: no NAL units in FFmpeg output",
-			"outputLen", len(output))
-		return
-	}
-
-	// Classify NALUs: extract SPS/PPS, filter out AUD/filler.
-	var sps, pps []byte
-	var filteredAU [][]byte
-	for _, nalu := range au {
+	nalus := fallback.ParseAnnexB(output)
+	for _, nalu := range nalus {
 		if len(nalu) == 0 {
 			continue
 		}
-		nalType := nalu[0] & 0x1F
-		if codec == "h265" && len(nalu) >= 2 {
-			nalType = (nalu[0] >> 1) & 0x3F
-		}
-
 		if codec != "h265" {
-			switch nalType {
+			switch nalu[0] & 0x1F {
 			case 7:
 				sps = nalu
-				filteredAU = append(filteredAU, nalu)
+				au = append(au, nalu)
 			case 8:
 				pps = nalu
-				filteredAU = append(filteredAU, nalu)
-			case 5, 1:
-				filteredAU = append(filteredAU, nalu)
-			case 6:
-				filteredAU = append(filteredAU, nalu)
+				au = append(au, nalu)
+			case 5, 1, 6:
+				au = append(au, nalu)
 			default:
-				sh.log.Debug("fallback: skipping NALU type", "type", nalType)
+				// Skip AUD, filler, etc.
 			}
 		} else {
-			filteredAU = append(filteredAU, nalu)
+			au = append(au, nalu)
 		}
 	}
+	return au, sps, pps
+}
 
-	if len(filteredAU) == 0 {
-		sh.log.Error("fallback: no usable NAL units after filtering")
-		return
-	}
-	au = filteredAU
-
-	// Update SDP with SPS/PPS.
-	if codec == "h264" && sps != nil && pps != nil {
-		sh.mu.Lock()
-		if sh.desc != nil && len(sh.desc.Medias) > 0 {
-			if h264Fmt, ok := sh.desc.Medias[0].Formats[0].(*format.H264); ok {
-				h264Fmt.SPS = sps
-				h264Fmt.PPS = pps
-			}
-		}
-		sh.mu.Unlock()
-		sh.log.Info("fallback: updated SPS/PPS in SDP",
-			"sps_size", len(sps), "pps_size", len(pps))
+// addIndicatorDot overlays a tiny (6x6 px) semi-transparent dot in the
+// bottom-right corner of a PNG image. The dot is far too small to trigger
+// Frigate's motion detection but visible to humans as a "stream alive"
+// indicator when the fallback alternates between frames with/without it.
+func addIndicatorDot(pngData []byte) []byte {
+	img, err := png.Decode(bytes.NewReader(pngData))
+	if err != nil {
+		return nil
 	}
 
-	// Set up RTP encoder, same as output format.
-	var h264Enc *rtph264.Encoder
-	var h265Enc *rtph265.Encoder
+	b := img.Bounds()
+	rgba := image.NewRGBA(b)
+	draw.Draw(rgba, b, img, b.Min, draw.Src)
 
-	if codec == "h265" {
-		h265Enc = &rtph265.Encoder{PayloadType: 96, PayloadMaxSize: 1200}
-		if err := h265Enc.Init(); err != nil {
-			sh.log.Error("h265 RTP encoder init", "error", err)
-			return
-		}
-	} else {
-		h264Enc = &rtph264.Encoder{
-			PayloadType:       96,
-			PayloadMaxSize:    1200,
-			PacketizationMode: 1,
-		}
-		if err := h264Enc.Init(); err != nil {
-			sh.log.Error("h264 RTP encoder init", "error", err)
-			return
-		}
+	// 6x6 dot, 14 px from the edges, subtle gray with alpha blending.
+	const dotSize = 6
+	const padding = 14
+	dotColor := image.NewUniform(color.NRGBA{R: 130, G: 130, B: 130, A: 90})
+	dotRect := image.Rect(
+		b.Max.X-padding-dotSize, b.Max.Y-padding-dotSize,
+		b.Max.X-padding, b.Max.Y-padding,
+	)
+	draw.Draw(rgba, dotRect, dotColor, image.Point{}, draw.Over)
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, rgba); err != nil {
+		return nil
 	}
-
-	clockRate := uint32(90000)
-	tsInc := clockRate / uint32(fps)
-	var ts uint32
-
-	sh.log.Info("fallback stream started",
-		"codec", codec, "fps", fps,
-		"size", fmt.Sprintf("%dx%d", w, h),
-		"nalus", len(au))
-
-	ticker := time.NewTicker(time.Second / time.Duration(fps))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			sh.log.Info("fallback stream stopped")
-			return
-		case <-ticker.C:
-		}
-
-		if codec == "h265" && h265Enc != nil {
-			pkts, err := h265Enc.Encode(au)
-			if err != nil {
-				sh.log.Error("fallback: H265 encode", "error", err)
-				continue
-			}
-			for _, pkt := range pkts {
-				pkt.Timestamp = ts
-				sh.writeToStream(pkt)
-			}
-		} else if h264Enc != nil {
-			pkts, err := h264Enc.Encode(au)
-			if err != nil {
-				sh.log.Error("fallback: H264 encode", "error", err)
-				continue
-			}
-			for _, pkt := range pkts {
-				pkt.Timestamp = ts
-				sh.writeToStream(pkt)
-			}
-		}
-		ts += tsInc
-	}
+	return buf.Bytes()
 }
