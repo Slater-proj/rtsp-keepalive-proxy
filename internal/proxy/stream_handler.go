@@ -251,8 +251,10 @@ func (sh *StreamHandler) SetStream(stream *gortsplib.ServerStream) {
 }
 
 // BuildDescription returns a session description matching the expected codec.
-// It advertises both a video track and a PCMA audio track so that consumers
-// like go2rtc / Frigate never complain about missing audio.
+// Video-only: no audio track is advertised. Battery cameras typically use
+// G.711 (pcm_alaw) which cannot be muxed into MP4 containers. Omitting
+// audio entirely avoids "Could not find tag for codec pcm_alaw" errors
+// in Frigate's recording FFmpeg.
 func (sh *StreamHandler) BuildDescription() *description.Session {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -269,29 +271,18 @@ func (sh *StreamHandler) BuildDescription() *description.Session {
 		}
 	}
 
-	af := &format.G711{
-		PayloadTyp:   8,
-		MULaw:        false,
-		SampleRate:   8000,
-		ChannelCount: 1,
-	}
-
 	sh.desc = &description.Session{
 		Medias: []*description.Media{
 			{
 				Type:    description.MediaTypeVideo,
 				Formats: []format.Format{vf},
 			},
-			{
-				Type:    description.MediaTypeAudio,
-				Formats: []format.Format{af},
-			},
 		},
 	}
 	return sh.desc
 }
 
-// Start begins the connection/relay/fallback loop and the silent audio generator.
+// Start begins the connection/relay/fallback loop.
 func (sh *StreamHandler) Start(ctx context.Context) {
 	ctx, sh.cancel = context.WithCancel(ctx)
 	sh.wg.Add(1)
@@ -299,7 +290,6 @@ func (sh *StreamHandler) Start(ctx context.Context) {
 		defer sh.wg.Done()
 		sh.loop(ctx)
 	}()
-	sh.startSilenceAudio(ctx)
 }
 
 // Stop terminates the handler and waits for all goroutines to finish.
@@ -307,6 +297,7 @@ func (sh *StreamHandler) Stop() {
 	if sh.cancel != nil {
 		sh.cancel()
 	}
+	sh.stopSilenceAudio()
 	sh.wg.Wait()
 	sh.stopFallback()
 	sh.stopSilenceAudio()
@@ -556,12 +547,17 @@ func (sh *StreamHandler) registerCallback(
 				return
 			}
 
-			// Filter out invalid / unsupported NAL types.
-			// If the AU contains data partitioning (types 2-4),
-			// discard the entire AU.
+			// Filter out invalid / unsupported NAL types and ensure
+			// the AU contains at least one VCL NALU (slice data).
+			// AUs with only parameter sets / SEI cause FFmpeg to
+			// report "missing picture in access unit" then
+			// mis-parse subsequent data as "data partitioning".
 			au = filterH264NALUs(au)
 			if len(au) == 0 {
 				return
+			}
+			if !hasVCL(au) {
+				return // No picture data -- skip entirely
 			}
 
 			// Wait for the first IDR before forwarding anything.
@@ -1390,7 +1386,15 @@ func copyBytes(b []byte) []byte {
 	return c
 }
 
-// filterH264NALUs removes empty NALUs and checks for unsupported types.
+// filterH264NALUs applies a strict whitelist of allowed H.264 NALU types.
+// Only types that are safe for downstream muxers/decoders are kept:
+//
+//	1  = non-IDR slice  (VCL)
+//	5  = IDR slice       (VCL)
+//	6  = SEI
+//	7  = SPS
+//	8  = PPS
+//
 // Returns nil (discarding the entire AU) if data partitioning NALUs
 // (types 2-4) are found, since no mainstream decoder supports them.
 func filterH264NALUs(au [][]byte) [][]byte {
@@ -1403,12 +1407,33 @@ func filterH264NALUs(au [][]byte) [][]byte {
 		if nt >= 2 && nt <= 4 {
 			return nil // Data partitioning: discard entire AU
 		}
-		if nt == 0 || nt >= 24 {
-			continue // Unspecified or RTP-only types (shouldn't be here)
+		// Whitelist: only keep safe, well-understood types.
+		switch nt {
+		case 1, 5, 6, 7, 8:
+			filtered = append(filtered, nalu)
+		default:
+			// Discard AUD (9), end-of-seq (10), end-of-stream (11),
+			// filler (12), SPS-ext (13), and any other non-standard
+			// types that can confuse downstream parsers.
 		}
-		filtered = append(filtered, nalu)
 	}
 	return filtered
+}
+
+// hasVCL returns true if the AU contains at least one VCL NALU
+// (type 1 = non-IDR slice, type 5 = IDR slice). AUs without VCL
+// data cause FFmpeg to emit "missing picture in access unit" and
+// cascade into false "data partitioning" errors.
+func hasVCL(au [][]byte) bool {
+	for _, nalu := range au {
+		if len(nalu) > 0 {
+			nt := nalu[0] & 0x1F
+			if nt == 1 || nt == 5 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // filterH265NALUs removes empty NALUs and filters invalid types.
