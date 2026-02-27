@@ -51,7 +51,7 @@ func (s CameraState) String() string {
 }
 
 // StreamHandler manages the lifecycle of a single camera stream:
-// connect → relay → detect sleep → fallback → reconnect.
+// connect -> relay -> detect sleep -> fallback -> reconnect.
 type StreamHandler struct {
 	Name string
 	cfg  config.ResolvedCamera
@@ -75,7 +75,7 @@ type StreamHandler struct {
 	fallbackCancel context.CancelFunc
 	fallbackWg     sync.WaitGroup
 
-	// Silent audio (PCMA) — keeps go2rtc/Frigate happy.
+	// Silent audio (PCMA) -- keeps go2rtc/Frigate happy.
 	silenceMu     sync.Mutex
 	silenceCancel context.CancelFunc
 	silenceWg     sync.WaitGroup
@@ -84,12 +84,10 @@ type StreamHandler struct {
 	lastCaptureTS atomic.Int64
 
 	// Pre-generated SPS/PPS for the initial SDP.
-	// Frigate uses preset-rtsp-restream (5 s default probing), but having
-	// sprop-parameter-sets speeds up decoder initialisation.
 	initialSPS []byte
 	initialPPS []byte
 
-	// ── RTP output normaliser ──────────────────────────────────────
+	// -- RTP output normaliser --
 	// Delivers a single continuous RTP stream (constant SSRC, monotonic
 	// SeqNum, smooth timestamps) to consumers regardless of source
 	// switches between camera relay and fallback.
@@ -121,11 +119,16 @@ func NewStreamHandler(name string, cfg config.ResolvedCamera) *StreamHandler {
 		log:           slog.With("camera", name),
 	}
 	sh.state.Store(int32(StateDisconnected))
-	sh.videoSSRC = 0x46414C4C // "FALL" — constant across source switches
+	sh.videoSSRC = 0x46414C4C // "FALL" -- constant across source switches
+
+	// Apply configured resolution hints to the fallback generator.
+	if cfg.Width > 0 && cfg.Height > 0 {
+		sh.fallbackGen.UpdateFrame(nil, cfg.Width, cfg.Height)
+		sh.log.Info("fallback resolution from config",
+			"width", cfg.Width, "height", cfg.Height)
+	}
 
 	// Pre-generate SPS/PPS so the SDP always has sprop-parameter-sets.
-	// Frigate uses preset-rtsp-restream (5 s probing) but having SPS/PPS
-	// in the SDP accelerates decoder initialisation significantly.
 	if codec == "h264" && cfg.FallbackMode != "none" {
 		sh.preGenerateSPSPPS()
 	}
@@ -134,13 +137,11 @@ func NewStreamHandler(name string, cfg config.ResolvedCamera) *StreamHandler {
 }
 
 // preGenerateSPSPPS runs FFmpeg synchronously to encode one placeholder
-// frame, extracting H.264 SPS/PPS NAL units. These are embedded into
-// the SDP (sprop-parameter-sets) so consumers with analyzeduration=0
-// can determine video dimensions without probing the RTP stream.
+// frame, extracting H.264 SPS/PPS NAL units for the initial SDP.
 func (sh *StreamHandler) preGenerateSPSPPS() {
 	pngData, w, h := sh.fallbackGen.GetFramePNG()
 	if len(pngData) == 0 {
-		sh.log.Warn("preGenerateSPSPPS: no PNG available, SDP will lack sprop-parameter-sets")
+		sh.log.Warn("preGenerateSPSPPS: no PNG available")
 		return
 	}
 
@@ -199,10 +200,10 @@ func (sh *StreamHandler) preGenerateSPSPPS() {
 			continue
 		}
 		switch nalu[0] & 0x1F {
-		case 7: // SPS
+		case 7:
 			sh.initialSPS = make([]byte, len(nalu))
 			copy(sh.initialSPS, nalu)
-		case 8: // PPS
+		case 8:
 			sh.initialPPS = make([]byte, len(nalu))
 			copy(sh.initialPPS, nalu)
 		}
@@ -214,7 +215,7 @@ func (sh *StreamHandler) preGenerateSPSPPS() {
 			"pps_size", len(sh.initialPPS),
 			"frame", fmt.Sprintf("%dx%d", w, h))
 	} else {
-		sh.log.Warn("preGenerateSPSPPS: could not extract SPS/PPS from FFmpeg output")
+		sh.log.Warn("preGenerateSPSPPS: could not extract SPS/PPS")
 	}
 }
 
@@ -265,10 +266,9 @@ func (sh *StreamHandler) BuildDescription() *description.Session {
 		}
 	}
 
-	// PCMA (G.711 a-law) audio — static payload type 8.
 	af := &format.G711{
 		PayloadTyp:   8,
-		MULaw:        false, // a-law = PCMA
+		MULaw:        false,
 		SampleRate:   8000,
 		ChannelCount: 1,
 	}
@@ -376,42 +376,48 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 	}
 	defer c.Close()
 
-	// Bail out early if context was cancelled during connection.
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 
-	desc, _, err := c.Describe(u)
+	srcDesc, _, err := c.Describe(u)
 	if err != nil {
 		return fmt.Errorf("describe: %w", err)
 	}
 
 	// Detect video media & codec.
-	videoMedia, codec := sh.findVideoMedia(desc)
+	videoMedia, codec := sh.findVideoMedia(srcDesc)
 	if videoMedia == nil {
 		return fmt.Errorf("no H.264/H.265 video track found")
 	}
 
 	sh.mu.Lock()
 	sh.detectedCodec = codec
+
 	// Copy source SPS/PPS to the output format so the SDP advertises
-	// sprop-parameter-sets. This lets consumers determine dimensions
-	// without probing the RTP stream.
+	// the camera's actual sprop-parameter-sets. Also extract dimensions
+	// to update the fallback generator.
 	if codec == "h264" {
 		var srcFmt *format.H264
-		if desc.FindFormat(&srcFmt) != nil && srcFmt != nil && srcFmt.SPS != nil {
+		if srcDesc.FindFormat(&srcFmt) != nil && srcFmt != nil {
 			if outFmt, ok := sh.desc.Medias[0].Formats[0].(*format.H264); ok {
-				outFmt.SPS = srcFmt.SPS
-				outFmt.PPS = srcFmt.PPS
+				if srcFmt.SPS != nil {
+					outFmt.SPS = srcFmt.SPS
+					outFmt.PPS = srcFmt.PPS
+				}
 			}
+			// Extract resolution from SPS for fallback generator.
+			sh.updateDimensionsFromSPS(srcFmt.SPS)
 		}
 	} else if codec == "h265" {
 		var srcFmt *format.H265
-		if desc.FindFormat(&srcFmt) != nil && srcFmt != nil && srcFmt.VPS != nil {
+		if srcDesc.FindFormat(&srcFmt) != nil && srcFmt != nil {
 			if outFmt, ok := sh.desc.Medias[0].Formats[0].(*format.H265); ok {
-				outFmt.VPS = srcFmt.VPS
-				outFmt.SPS = srcFmt.SPS
-				outFmt.PPS = srcFmt.PPS
+				if srcFmt.VPS != nil {
+					outFmt.VPS = srcFmt.VPS
+					outFmt.SPS = srcFmt.SPS
+					outFmt.PPS = srcFmt.PPS
+				}
 			}
 		}
 	}
@@ -422,7 +428,7 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	if _, err := c.Setup(desc.BaseURL, videoMedia, 0, 0); err != nil {
+	if _, err := c.Setup(srcDesc.BaseURL, videoMedia, 0, 0); err != nil {
 		return fmt.Errorf("setup: %w", err)
 	}
 
@@ -436,16 +442,14 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 		lastPktTimeMu sync.Mutex
 	)
 
-	// Stop fallback BEFORE relay to prevent concurrent writes that
-	// could corrupt the H.264 bitstream.
+	// Stop fallback BEFORE relay to prevent concurrent writes.
 	sh.stopFallback()
 
-	// Reset the video timeline so the camera’s timestamps map smoothly
-	// onto the output timeline that the fallback was using.
+	// Reset the video timeline so the camera's timestamps map smoothly.
 	sh.resetVideoTimeline()
 
-	// Register RTP callback.
-	sh.registerCallback(c, desc, &lastPktTime, &lastPktTimeMu)
+	// Register RTP callback with decode+re-encode.
+	sh.registerCallback(c, srcDesc, &lastPktTime, &lastPktTimeMu)
 
 	if _, err := c.Play(nil); err != nil {
 		return fmt.Errorf("play: %w", err)
@@ -487,18 +491,41 @@ func (sh *StreamHandler) findVideoMedia(desc *description.Session) (*description
 	return nil, ""
 }
 
+// registerCallback sets up the RTP callback that DECODES camera RTP packets
+// into NAL units, then RE-ENCODES them using our own encoder. This guarantees
+// every output packet exactly matches our SDP format (PacketizationMode=1,
+// PT=96, correct FU-A/STAP-A boundaries). Raw packet forwarding is the root
+// cause of "data partitioning is not implemented" errors -- the camera's RTP
+// packetization does not necessarily match our declared format.
 func (sh *StreamHandler) registerCallback(
 	c *gortsplib.Client,
 	desc *description.Session,
 	lastPktTime *time.Time,
 	lastPktTimeMu *sync.Mutex,
 ) {
-	// Find the concrete format to create the appropriate decoder.
 	var h264f *format.H264
 	var h265f *format.H265
 
 	if desc.FindFormat(&h264f) != nil {
-		dec, _ := h264f.CreateDecoder()
+		// Create decoder from source format -- this handles FU-A reassembly,
+		// STAP-A splitting, reordering, etc.
+		dec, decErr := h264f.CreateDecoder()
+		if decErr != nil {
+			sh.log.Error("failed to create H264 decoder", "error", decErr)
+			return
+		}
+
+		// Create our OWN encoder matching the output SDP exactly.
+		enc := &rtph264.Encoder{
+			PayloadType:       96,
+			PayloadMaxSize:    1200,
+			PacketizationMode: 1,
+		}
+		if err := enc.Init(); err != nil {
+			sh.log.Error("failed to create H264 output encoder", "error", err)
+			return
+		}
+
 		c.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
 			defer func() {
 				if r := recover(); r != nil {
@@ -510,18 +537,50 @@ func (sh *StreamHandler) registerCallback(
 			*lastPktTime = time.Now()
 			lastPktTimeMu.Unlock()
 
-			// Decode BEFORE normalising: the decoder needs the
-			// camera’s original sequence numbers for reordering.
-			if dec != nil {
-				if au, err := dec.Decode(pkt); err == nil {
-					sh.captureKeyframeH264(au)
-				}
+			// Decode: reassemble the camera's RTP packets into a
+			// complete H.264 access unit (list of NAL units).
+			// Returns nil if the AU is not yet complete (e.g. FU-A).
+			au, err := dec.Decode(pkt)
+			if err != nil || au == nil {
+				return
 			}
 
-			sh.writeToStream(pkt)
+			// Capture keyframe for fallback image.
+			sh.captureKeyframeH264(au)
+
+			// Re-encode through OUR encoder. This produces RTP packets
+			// with correct STAP-A / FU-A / single-NALU boundaries
+			// matching PacketizationMode=1.
+			outPkts, err := enc.Encode(au)
+			if err != nil {
+				sh.log.Debug("H264 re-encode error", "error", err)
+				return
+			}
+
+			// Carry the source timestamp so the output timeline is
+			// based on the camera's clock (normalised by writeToStream).
+			for _, outPkt := range outPkts {
+				outPkt.Timestamp = pkt.Timestamp
+				sh.writeToStream(outPkt)
+			}
 		})
+
 	} else if desc.FindFormat(&h265f) != nil {
-		dec, _ := h265f.CreateDecoder()
+		dec, decErr := h265f.CreateDecoder()
+		if decErr != nil {
+			sh.log.Error("failed to create H265 decoder", "error", decErr)
+			return
+		}
+
+		enc := &rtph265.Encoder{
+			PayloadType:    96,
+			PayloadMaxSize: 1200,
+		}
+		if err := enc.Init(); err != nil {
+			sh.log.Error("failed to create H265 output encoder", "error", err)
+			return
+		}
+
 		c.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
 			defer func() {
 				if r := recover(); r != nil {
@@ -533,19 +592,103 @@ func (sh *StreamHandler) registerCallback(
 			*lastPktTime = time.Now()
 			lastPktTimeMu.Unlock()
 
-			if dec != nil {
-				if au, err := dec.Decode(pkt); err == nil {
-					sh.captureKeyframeH265(au)
-				}
+			au, err := dec.Decode(pkt)
+			if err != nil || au == nil {
+				return
 			}
 
-			sh.writeToStream(pkt)
+			sh.captureKeyframeH265(au)
+
+			outPkts, err := enc.Encode(au)
+			if err != nil {
+				sh.log.Debug("H265 re-encode error", "error", err)
+				return
+			}
+
+			for _, outPkt := range outPkts {
+				outPkt.Timestamp = pkt.Timestamp
+				sh.writeToStream(outPkt)
+			}
 		})
 	}
 }
 
+// updateDimensionsFromSPS parses the H.264 SPS to extract width/height
+// and updates the fallback generator accordingly. This ensures the fallback
+// frame matches the camera's actual resolution (critical for low streams
+// which are typically 640x480 or similar, not 1920x1080).
+func (sh *StreamHandler) updateDimensionsFromSPS(sps []byte) {
+	if len(sps) < 4 {
+		return
+	}
+
+	// Minimal SPS parsing: extract pic_width/pic_height from the bitstream.
+	// Full SPS parsing is complex (Exp-Golomb coded), so we use FFmpeg
+	// to probe the resolution from a minimal Annex-B stream.
+	var annexB bytes.Buffer
+	annexB.Write([]byte{0x00, 0x00, 0x00, 0x01})
+	annexB.Write(sps)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-hide_banner",
+		"-f", "h264", "-i", "pipe:0",
+		"-f", "null", "-",
+	)
+	cmd.Stdin = &annexB
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	cmd.Run() // Intentionally ignore error -- we parse stderr for dimensions.
+
+	output := stderr.String()
+	w, h := parseDimensionsFromFFmpeg(output)
+	if w > 0 && h > 0 {
+		sh.fallbackGen.UpdateFrame(nil, w, h)
+		sh.log.Info("updated dimensions from camera SPS",
+			"width", w, "height", h)
+	}
+}
+
+// parseDimensionsFromFFmpeg extracts WxH from FFmpeg stderr output.
+// Looks for patterns like "1920x1080" or "640x480" in stream info lines.
+func parseDimensionsFromFFmpeg(output string) (int, int) {
+	// FFmpeg prints lines like: "Stream #0:0: Video: h264 ..., 1920x1080, ..."
+	// We look for NxM patterns where N and M are reasonable dimensions.
+	var w, h int
+	for i := 0; i < len(output)-4; i++ {
+		if output[i] >= '1' && output[i] <= '9' {
+			// Try to parse WxH
+			j := i
+			for j < len(output) && output[j] >= '0' && output[j] <= '9' {
+				j++
+			}
+			if j < len(output) && output[j] == 'x' {
+				k := j + 1
+				for k < len(output) && output[k] >= '0' && output[k] <= '9' {
+					k++
+				}
+				if k > j+1 {
+					wStr := output[i:j]
+					hStr := output[j+1 : k]
+					var tw, th int
+					fmt.Sscanf(wStr, "%d", &tw)
+					fmt.Sscanf(hStr, "%d", &th)
+					if tw >= 160 && tw <= 7680 && th >= 120 && th <= 4320 {
+						w, h = tw, th
+						break
+					}
+				}
+			}
+		}
+	}
+	return w, h
+}
+
 // resetVideoTimeline is called whenever the video source changes
-// (fallback → camera or camera → fallback). The next writeToStream
+// (fallback -> camera or camera -> fallback). The next writeToStream
 // call will map the new source's first timestamp so that the output
 // timeline continues smoothly from where the previous source left off.
 func (sh *StreamHandler) resetVideoTimeline() {
@@ -580,7 +723,7 @@ func (sh *StreamHandler) writeToStream(pkt *rtp.Packet) {
 		return
 	}
 
-	// ── Normalise ────────────────────────────────────────────────
+	// -- Normalise --
 	pkt.PayloadType = 96
 	pkt.SSRC = sh.videoSSRC
 	pkt.SequenceNumber = sh.videoSeq
@@ -592,7 +735,7 @@ func (sh *StreamHandler) writeToStream(pkt *rtp.Packet) {
 			sh.videoOutBase = 0
 		} else {
 			// Leave a 40 ms gap (~3600 ticks at 90 kHz) between
-			// old and new source — equivalent to one frame at 25 fps.
+			// old and new source.
 			sh.videoOutBase = sh.videoLastOut + 3600
 		}
 		sh.videoInited = true
@@ -602,7 +745,7 @@ func (sh *StreamHandler) writeToStream(pkt *rtp.Packet) {
 	sh.videoLastOut = outTS
 	pkt.Timestamp = outTS
 
-	// ── Write ────────────────────────────────────────────────────
+	// -- Write --
 	if err := stream.WritePacketRTP(desc.Medias[0], pkt); err != nil {
 		sh.log.Debug("video WritePacketRTP error", "error", err)
 	}
@@ -633,7 +776,7 @@ func (sh *StreamHandler) writeAudioToStream(pkt *rtp.Packet) {
 }
 
 // -----------------------------------------------------------------------
-// Silent audio (PCMA) — continuous G.711 a-law silence so go2rtc is happy
+// Silent audio (PCMA) -- continuous G.711 a-law silence so go2rtc is happy
 // -----------------------------------------------------------------------
 
 func (sh *StreamHandler) startSilenceAudio(ctx context.Context) {
@@ -671,14 +814,12 @@ func (sh *StreamHandler) runSilenceAudio(ctx context.Context) {
 		}
 	}()
 
-	// PCMA 8 kHz, 20 ms packets → 160 samples/packet.
 	const (
 		sampleRate       = 8000
 		packetDurationMs = 20
-		samplesPerPacket = sampleRate * packetDurationMs / 1000 // 160
+		samplesPerPacket = sampleRate * packetDurationMs / 1000
 	)
 
-	// G.711 a-law silence byte.
 	silence := make([]byte, samplesPerPacket)
 	for i := range silence {
 		silence[i] = 0xD5
@@ -703,7 +844,7 @@ func (sh *StreamHandler) runSilenceAudio(ctx context.Context) {
 		pkt := &rtp.Packet{
 			Header: rtp.Header{
 				Version:        2,
-				PayloadType:    8, // PCMA
+				PayloadType:    8,
 				SequenceNumber: seq,
 				Timestamp:      ts,
 				SSRC:           0xDEADABCD,
@@ -722,9 +863,6 @@ func (sh *StreamHandler) runSilenceAudio(ctx context.Context) {
 // -----------------------------------------------------------------------
 
 func (sh *StreamHandler) captureKeyframeH264(au [][]byte) {
-	// Also extract and propagate SPS/PPS to the output format when
-	// we see them from the real camera. This updates the SDP's
-	// sprop-parameter-sets for new consumer sessions.
 	var sps, pps []byte
 	hasIDR := false
 
@@ -745,11 +883,16 @@ func (sh *StreamHandler) captureKeyframeH264(au [][]byte) {
 	// Update SPS/PPS in the output format.
 	if sps != nil && pps != nil {
 		sh.mu.Lock()
-		if h264Fmt, ok := sh.desc.Medias[0].Formats[0].(*format.H264); ok {
-			h264Fmt.SPS = sps
-			h264Fmt.PPS = pps
+		if sh.desc != nil && len(sh.desc.Medias) > 0 {
+			if h264Fmt, ok := sh.desc.Medias[0].Formats[0].(*format.H264); ok {
+				h264Fmt.SPS = sps
+				h264Fmt.PPS = pps
+			}
 		}
 		sh.mu.Unlock()
+
+		// Also update fallback generator dimensions from new SPS.
+		sh.updateDimensionsFromSPS(sps)
 	}
 
 	if hasIDR {
@@ -763,7 +906,7 @@ func (sh *StreamHandler) captureKeyframeH265(au [][]byte) {
 			continue
 		}
 		naluType := (nalu[0] >> 1) & 0x3F
-		if naluType == 19 || naluType == 20 { // IDR_W_RADL / IDR_N_LP
+		if naluType == 19 || naluType == 20 {
 			sh.decodeAndStore(au, "h265")
 			return
 		}
@@ -771,14 +914,12 @@ func (sh *StreamHandler) captureKeyframeH265(au [][]byte) {
 }
 
 func (sh *StreamHandler) decodeAndStore(nalus [][]byte, codec string) {
-	// Rate-limit: max one capture every 5 seconds to avoid FFmpeg storms.
 	now := time.Now().Unix()
 	if last := sh.lastCaptureTS.Load(); now-last < 5 {
 		return
 	}
 	sh.lastCaptureTS.Store(now)
 
-	// Build Annex-B stream.
 	var buf bytes.Buffer
 	for _, nalu := range nalus {
 		buf.Write([]byte{0x00, 0x00, 0x00, 0x01})
@@ -828,23 +969,17 @@ func (sh *StreamHandler) startFallback(ctx context.Context) {
 	defer sh.fallbackMu.Unlock()
 
 	if sh.fallbackCancel != nil {
-		return // already running
+		return
 	}
 
 	fbCtx, cancel := context.WithCancel(ctx)
 	sh.fallbackCancel = cancel
-	// Reset video timeline so fallback timestamps map smoothly
-	// onto the output timeline the camera was using.
 	sh.resetVideoTimeline()
 	sh.wg.Add(1)
 	sh.fallbackWg.Add(1)
 	go func() {
 		defer sh.wg.Done()
 		defer sh.fallbackWg.Done()
-		// Clear fallbackCancel when the goroutine exits for ANY reason
-		// (context cancelled, FFmpeg failure, no PNG data, etc.).
-		// Without this, an early exit leaves fallbackCancel non-nil,
-		// and startFallback would think the goroutine is still running.
 		defer func() {
 			sh.fallbackMu.Lock()
 			sh.fallbackCancel = nil
@@ -854,8 +989,6 @@ func (sh *StreamHandler) startFallback(ctx context.Context) {
 	}()
 }
 
-// stopFallback cancels the fallback goroutine and WAITS for it to finish.
-// This guarantees no fallback writes can race with the real camera relay.
 func (sh *StreamHandler) stopFallback() {
 	sh.fallbackMu.Lock()
 	cancel := sh.fallbackCancel
@@ -881,14 +1014,12 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		fps = 5
 	}
 
-	// Get fallback PNG from the generator.
 	pngData, w, h := sh.fallbackGen.GetFramePNG()
 	if len(pngData) == 0 {
 		sh.log.Error("no fallback frame available")
 		return
 	}
 
-	// H.264/H.265 require even dimensions.
 	if w%2 != 0 {
 		w++
 	}
@@ -896,7 +1027,6 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		h++
 	}
 
-	// Write PNG to a temp file for FFmpeg.
 	tmpFile, err := os.CreateTemp("", fmt.Sprintf("fallback-%s-*.png", sh.Name))
 	if err != nil {
 		sh.log.Error("fallback: create temp file", "error", err)
@@ -912,25 +1042,11 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 	}
 	tmpFile.Close()
 
-	// Bail out early if context was cancelled during file I/O.
 	if ctx.Err() != nil {
 		return
 	}
 
-	// ── Encode ONE IDR frame with FFmpeg ─────────────────────────────
-	//
-	// Previous approach used a continuous FFmpeg process with a streaming
-	// Annex-B parser piped through goroutines/channels. This was fragile:
-	// pipe buffering and byte-level parser edge cases could silently
-	// corrupt NAL unit boundaries, producing garbage NAL types (2/3/4)
-	// that FFmpeg on the consumer side reports as "data partitioning is
-	// not implemented".
-	//
-	// New approach: run FFmpeg once (-frames:v 1), batch-parse the output
-	// with ParseAnnexB, and re-emit the same [SPS, PPS, IDR] access unit
-	// at the configured FPS. Zero goroutines, zero channels, zero
-	// streaming parser state — just a simple ticker loop.
-
+	// Encode ONE IDR frame with FFmpeg, then re-emit at FPS.
 	encCodec := "libx264"
 	outFmt := "h264"
 	var encoderArgs []string
@@ -966,8 +1082,6 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		"pipe:1",
 	)
 
-	// Use a dedicated timeout so encoding completes even if the
-	// parent context is cancelled while FFmpeg is running.
 	encCtx, encCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer encCancel()
 
@@ -982,7 +1096,6 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		return
 	}
 
-	// Batch-parse the Annex-B output into individual NAL units.
 	au := fallback.ParseAnnexB(output)
 	if len(au) == 0 {
 		sh.log.Error("fallback: no NAL units in FFmpeg output",
@@ -990,12 +1103,7 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		return
 	}
 
-	// ── Classify NALUs and update SDP ────────────────────────────────
-	// Extract SPS/PPS so we can:
-	// 1. Set sprop-parameter-sets in the SDP → consumers know dimensions
-	//    immediately without probing.
-	// 2. Filter out AUD/filler NALUs that some consumers don't expect.
-
+	// Classify NALUs: extract SPS/PPS, filter out AUD/filler.
 	var sps, pps []byte
 	var filteredAU [][]byte
 	for _, nalu := range au {
@@ -1007,27 +1115,22 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 			nalType = (nalu[0] >> 1) & 0x3F
 		}
 
-		sh.log.Info("fallback NAL unit",
-			"type", nalType, "size", len(nalu))
-
 		if codec != "h265" {
 			switch nalType {
-			case 7: // SPS
+			case 7:
 				sps = nalu
 				filteredAU = append(filteredAU, nalu)
-			case 8: // PPS
+			case 8:
 				pps = nalu
 				filteredAU = append(filteredAU, nalu)
-			case 5, 1: // IDR, non-IDR slice
+			case 5, 1:
 				filteredAU = append(filteredAU, nalu)
-			case 6: // SEI — include for compatibility
+			case 6:
 				filteredAU = append(filteredAU, nalu)
-			// Skip AUD (9), filler (12), and other non-essential NALUs.
 			default:
 				sh.log.Debug("fallback: skipping NALU type", "type", nalType)
 			}
 		} else {
-			// H.265: keep all NALUs
 			filteredAU = append(filteredAU, nalu)
 		}
 	}
@@ -1038,25 +1141,21 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 	}
 	au = filteredAU
 
-	// Update SDP with SPS/PPS so consumers get sprop-parameter-sets.
+	// Update SDP with SPS/PPS.
 	if codec == "h264" && sps != nil && pps != nil {
 		sh.mu.Lock()
-		if h264Fmt, ok := sh.desc.Medias[0].Formats[0].(*format.H264); ok {
-			h264Fmt.SPS = sps
-			h264Fmt.PPS = pps
+		if sh.desc != nil && len(sh.desc.Medias) > 0 {
+			if h264Fmt, ok := sh.desc.Medias[0].Formats[0].(*format.H264); ok {
+				h264Fmt.SPS = sps
+				h264Fmt.PPS = pps
+			}
 		}
 		sh.mu.Unlock()
 		sh.log.Info("fallback: updated SPS/PPS in SDP",
 			"sps_size", len(sps), "pps_size", len(pps))
 	}
 
-	// ── Set up RTP encoder ───────────────────────────────────────────
-	//
-	// Use the standard gortsplib pattern: pass the full access unit to
-	// a single Encode() call. The encoder handles STAP-A (small NALUs),
-	// FU-A (large NALUs), and single-NALU formats per RFC 6184.
-	// PacketizationMode MUST be 1 to match the SDP declaration.
-
+	// Set up RTP encoder, same as output format.
 	var h264Enc *rtph264.Encoder
 	var h265Enc *rtph265.Encoder
 
@@ -1070,7 +1169,7 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		h264Enc = &rtph264.Encoder{
 			PayloadType:       96,
 			PayloadMaxSize:    1200,
-			PacketizationMode: 1, // must match SDP
+			PacketizationMode: 1,
 		}
 		if err := h264Enc.Init(); err != nil {
 			sh.log.Error("h264 RTP encoder init", "error", err)
@@ -1086,11 +1185,6 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		"codec", codec, "fps", fps,
 		"size", fmt.Sprintf("%dx%d", w, h),
 		"nalus", len(au))
-
-	// ── Emission loop ────────────────────────────────────────────────
-	// Re-emit the same pre-encoded access unit at the configured FPS.
-	// The output normaliser in writeToStream ensures consumers see a
-	// continuous stream with monotonic timestamps.
 
 	ticker := time.NewTicker(time.Second / time.Duration(fps))
 	defer ticker.Stop()
@@ -1114,10 +1208,6 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 				sh.writeToStream(pkt)
 			}
 		} else if h264Enc != nil {
-			// Standard gortsplib pattern: encode the complete access
-			// unit in a single call. The encoder produces the correct
-			// mix of single-NALU / STAP-A / FU-A packets per RFC 6184
-			// and sets the marker bit on the last packet.
 			pkts, err := h264Enc.Encode(au)
 			if err != nil {
 				sh.log.Error("fallback: H264 encode", "error", err)

@@ -39,6 +39,16 @@ type CameraConfig struct {
 	Source    string `yaml:"source"`
 	SourceLow string `yaml:"source_low"`
 
+	// Optional resolution hints for fallback frames. When the camera has
+	// never connected, these are used instead of the default 1920x1080.
+	// Particularly important for low streams that are typically 640x480.
+	Width  *int `yaml:"width,omitempty"`
+	Height *int `yaml:"height,omitempty"`
+
+	// Low stream resolution (used for source_low fallback).
+	WidthLow  *int `yaml:"width_low,omitempty"`
+	HeightLow *int `yaml:"height_low,omitempty"`
+
 	BatteryMode   *bool          `yaml:"battery_mode,omitempty"`
 	RetryInterval *time.Duration `yaml:"retry_interval,omitempty"`
 	Timeout       *time.Duration `yaml:"timeout,omitempty"`
@@ -58,6 +68,12 @@ func (c CameraConfig) Effective(d CameraDefaults) ResolvedCamera {
 		FallbackFPS:   d.FallbackFPS,
 		FallbackMode:  d.FallbackMode,
 		Codec:         d.Codec,
+	}
+	if c.Width != nil {
+		r.Width = *c.Width
+	}
+	if c.Height != nil {
+		r.Height = *c.Height
 	}
 	if c.BatteryMode != nil {
 		r.BatteryMode = *c.BatteryMode
@@ -84,6 +100,8 @@ func (c CameraConfig) Effective(d CameraDefaults) ResolvedCamera {
 type ResolvedCamera struct {
 	Source        string
 	SourceLow     string
+	Width         int // fallback resolution hint (0 = auto-detect or default 1920)
+	Height        int // fallback resolution hint (0 = auto-detect or default 1080)
 	BatteryMode   bool
 	RetryInterval time.Duration
 	Timeout       time.Duration

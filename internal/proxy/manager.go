@@ -31,6 +31,20 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 			lowName := "low_" + name
 			lowResolved := resolved
 			lowResolved.Source = resolved.SourceLow
+
+			// Use low stream dimensions if configured, otherwise use
+			// a sensible default for sub-streams (typically 640x480).
+			if camCfg.WidthLow != nil {
+				lowResolved.Width = *camCfg.WidthLow
+			} else if lowResolved.Width == 0 {
+				lowResolved.Width = 640
+			}
+			if camCfg.HeightLow != nil {
+				lowResolved.Height = *camCfg.HeightLow
+			} else if lowResolved.Height == 0 {
+				lowResolved.Height = 480
+			}
+
 			handlers[lowName] = NewStreamHandler(lowName, lowResolved)
 			slog.Info("registered stream", "name", lowName, "source", lowResolved.Source)
 		}
