@@ -633,6 +633,15 @@ func (sh *StreamHandler) startFallback(ctx context.Context) {
 	go func() {
 		defer sh.wg.Done()
 		defer sh.fallbackWg.Done()
+		// Clear fallbackCancel when the goroutine exits for ANY reason
+		// (context cancelled, FFmpeg failure, no PNG data, etc.).
+		// Without this, an early exit leaves fallbackCancel non-nil,
+		// and startFallback would think the goroutine is still running.
+		defer func() {
+			sh.fallbackMu.Lock()
+			sh.fallbackCancel = nil
+			sh.fallbackMu.Unlock()
+		}()
 		sh.runFallback(fbCtx)
 	}()
 }
