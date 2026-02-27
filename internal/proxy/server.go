@@ -71,8 +71,13 @@ func (s *Server) Stop() {
 }
 
 // pathFromCtx returns the cleaned camera name from a request path.
+// Query parameters and fragments are stripped.
 func pathFromCtx(rawPath string) string {
-	return strings.TrimPrefix(strings.TrimPrefix(rawPath, "/"), "/")
+	p := strings.TrimPrefix(strings.TrimPrefix(rawPath, "/"), "/")
+	if idx := strings.IndexByte(p, '?'); idx >= 0 {
+		p = p[:idx]
+	}
+	return p
 }
 
 // ---------------------------------------------------------------------------

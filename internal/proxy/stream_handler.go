@@ -74,6 +74,7 @@ type StreamHandler struct {
 	fallbackGen    *fallback.Generator
 	fallbackMu     sync.Mutex
 	fallbackCancel context.CancelFunc
+	fallbackWg     sync.WaitGroup
 
 	// Silent audio (PCMA) — keeps go2rtc/Frigate happy.
 	silenceMu     sync.Mutex
@@ -298,6 +299,10 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 		lastPktTimeMu sync.Mutex
 	)
 
+	// Stop fallback BEFORE relay to prevent concurrent writes that
+	// corrupt the H.264 bitstream (causing "data partitioning" errors).
+	sh.stopFallback()
+
 	// Register RTP callback.
 	sh.registerCallback(c, desc, &lastPktTime, &lastPktTimeMu)
 
@@ -305,8 +310,6 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 		return fmt.Errorf("play: %w", err)
 	}
 
-	// Camera is live — stop fallback.
-	sh.stopFallback()
 	sh.state.Store(int32(StateOnline))
 	sh.lastOnline.Store(time.Now().Unix())
 	sh.log.Info("camera online, relaying")
@@ -626,20 +629,26 @@ func (sh *StreamHandler) startFallback(ctx context.Context) {
 	fbCtx, cancel := context.WithCancel(ctx)
 	sh.fallbackCancel = cancel
 	sh.wg.Add(1)
+	sh.fallbackWg.Add(1)
 	go func() {
 		defer sh.wg.Done()
+		defer sh.fallbackWg.Done()
 		sh.runFallback(fbCtx)
 	}()
 }
 
+// stopFallback cancels the fallback goroutine and WAITS for it to finish.
+// This guarantees no fallback writes can race with the real camera relay.
 func (sh *StreamHandler) stopFallback() {
 	sh.fallbackMu.Lock()
-	defer sh.fallbackMu.Unlock()
+	cancel := sh.fallbackCancel
+	sh.fallbackCancel = nil
+	sh.fallbackMu.Unlock()
 
-	if sh.fallbackCancel != nil {
-		sh.fallbackCancel()
-		sh.fallbackCancel = nil
+	if cancel != nil {
+		cancel()
 	}
+	sh.fallbackWg.Wait()
 }
 
 func (sh *StreamHandler) runFallback(ctx context.Context) {
@@ -693,25 +702,23 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 
 	fpsStr := strconv.Itoa(fps)
 
+	// keyint=1 → every frame is an IDR with SPS/PPS.  This is critical:
+	// consumers can start decoding at any point and never see
+	// "missing picture" or "data partitioning" errors.
 	switch codec {
 	case "h265":
 		encoder = "libx265"
 		outFmt = "hevc"
 		encoderArgs = []string{
 			"-preset", "ultrafast",
-			"-x265-params", fmt.Sprintf(
-				"keyint=%d:min-keyint=%d:scenecut=0:bframes=0:repeat-headers=1:log-level=error",
-				fps, fps),
+			"-x265-params", "keyint=1:min-keyint=1:scenecut=0:bframes=0:repeat-headers=1:log-level=error",
 		}
 	default:
 		encoderArgs = []string{
 			"-preset", "ultrafast",
-			"-tune", "stillimage",
 			"-profile:v", "baseline",
 			"-level", "3.1",
-			"-x264-params", fmt.Sprintf(
-				"keyint=%d:min-keyint=%d:scenecut=0:bframes=0:repeat-headers=1",
-				fps, fps),
+			"-x264-params", "keyint=1:min-keyint=1:scenecut=0:bframes=0:repeat-headers=1",
 		}
 	}
 
