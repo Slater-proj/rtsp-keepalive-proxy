@@ -279,6 +279,18 @@ func (sh *StreamHandler) BuildDescription() *description.Session {
 			},
 		},
 	}
+
+	// Log SDP readiness so operators can verify sprop-parameter-sets.
+	if sh.detectedCodec != "h265" {
+		if h, ok := vf.(*format.H264); ok {
+			sh.log.Info("SDP built",
+				"has_sps", h.SPS != nil,
+				"has_pps", h.PPS != nil,
+				"sps_len", len(h.SPS),
+				"pps_len", len(h.PPS))
+		}
+	}
+
 	return sh.desc
 }
 
@@ -297,7 +309,6 @@ func (sh *StreamHandler) Stop() {
 	if sh.cancel != nil {
 		sh.cancel()
 	}
-	sh.stopSilenceAudio()
 	sh.wg.Wait()
 	sh.stopFallback()
 	sh.stopSilenceAudio()
@@ -313,6 +324,17 @@ func (sh *StreamHandler) loop(ctx context.Context) {
 		"retry", sh.cfg.RetryInterval,
 		"timeout", sh.cfg.Timeout,
 	)
+
+	// For battery cameras, start fallback IMMEDIATELY so consumers
+	// (Frigate FFmpeg) always have video from the very first moment
+	// they connect. Without this, the first connectAndRelay() blocks
+	// for up to `timeout` seconds while trying the camera, during
+	// which zero RTP packets are written --> FFmpeg times out on
+	// format probing --> "no recording segments created".
+	if sh.cfg.BatteryMode && sh.cfg.FallbackMode != "none" {
+		sh.state.Store(int32(StateSleeping))
+		sh.startFallback(ctx)
+	}
 
 	for {
 		select {
