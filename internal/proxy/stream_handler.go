@@ -84,10 +84,22 @@ type StreamHandler struct {
 	lastCaptureTS atomic.Int64
 
 	// Pre-generated SPS/PPS for the initial SDP.
-	// Without these in the SDP, Frigate's FFmpeg (analyzeduration=0)
-	// cannot determine video dimensions and fails.
+	// Frigate uses preset-rtsp-restream (5 s default probing), but having
+	// sprop-parameter-sets speeds up decoder initialisation.
 	initialSPS []byte
 	initialPPS []byte
+
+	// ── RTP output normaliser ──────────────────────────────────────
+	// Delivers a single continuous RTP stream (constant SSRC, monotonic
+	// SeqNum, smooth timestamps) to consumers regardless of source
+	// switches between camera relay and fallback.
+	videoSSRC    uint32
+	videoSeq     uint16
+	videoSrcBase uint32 // first RTP TS from current source
+	videoOutBase uint32 // output TS corresponding to srcBase
+	videoLastOut uint32 // last emitted output TS
+	videoInited  bool
+	videoMu      sync.Mutex // serialises all video writes
 
 	// Lifecycle
 	cancel context.CancelFunc
@@ -109,11 +121,11 @@ func NewStreamHandler(name string, cfg config.ResolvedCamera) *StreamHandler {
 		log:           slog.With("camera", name),
 	}
 	sh.state.Store(int32(StateDisconnected))
+	sh.videoSSRC = 0x46414C4C // "FALL" — constant across source switches
 
 	// Pre-generate SPS/PPS so the SDP always has sprop-parameter-sets.
-	// This is critical: Frigate sets analyzeduration=0 (no probing),
-	// so without SPS/PPS in the SDP, FFmpeg can't determine dimensions
-	// and its decoder misinterprets NAL data.
+	// Frigate uses preset-rtsp-restream (5 s probing) but having SPS/PPS
+	// in the SDP accelerates decoder initialisation significantly.
 	if codec == "h264" && cfg.FallbackMode != "none" {
 		sh.preGenerateSPSPPS()
 	}
@@ -425,8 +437,12 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 	)
 
 	// Stop fallback BEFORE relay to prevent concurrent writes that
-	// corrupt the H.264 bitstream (causing "data partitioning" errors).
+	// could corrupt the H.264 bitstream.
 	sh.stopFallback()
+
+	// Reset the video timeline so the camera’s timestamps map smoothly
+	// onto the output timeline that the fallback was using.
+	sh.resetVideoTimeline()
 
 	// Register RTP callback.
 	sh.registerCallback(c, desc, &lastPktTime, &lastPktTimeMu)
@@ -494,13 +510,15 @@ func (sh *StreamHandler) registerCallback(
 			*lastPktTime = time.Now()
 			lastPktTimeMu.Unlock()
 
-			sh.writeToStream(pkt)
-
+			// Decode BEFORE normalising: the decoder needs the
+			// camera’s original sequence numbers for reordering.
 			if dec != nil {
 				if au, err := dec.Decode(pkt); err == nil {
 					sh.captureKeyframeH264(au)
 				}
 			}
+
+			sh.writeToStream(pkt)
 		})
 	} else if desc.FindFormat(&h265f) != nil {
 		dec, _ := h265f.CreateDecoder()
@@ -515,18 +533,35 @@ func (sh *StreamHandler) registerCallback(
 			*lastPktTime = time.Now()
 			lastPktTimeMu.Unlock()
 
-			sh.writeToStream(pkt)
-
 			if dec != nil {
 				if au, err := dec.Decode(pkt); err == nil {
 					sh.captureKeyframeH265(au)
 				}
 			}
+
+			sh.writeToStream(pkt)
 		})
 	}
 }
 
+// resetVideoTimeline is called whenever the video source changes
+// (fallback → camera or camera → fallback). The next writeToStream
+// call will map the new source's first timestamp so that the output
+// timeline continues smoothly from where the previous source left off.
+func (sh *StreamHandler) resetVideoTimeline() {
+	sh.videoMu.Lock()
+	defer sh.videoMu.Unlock()
+	sh.videoInited = false
+}
+
+// writeToStream normalises an RTP packet and writes it to the output
+// server stream. All output packets share a single SSRC with monotonic
+// sequence numbers and a smooth timestamp timeline, regardless of
+// whether the packet originates from the camera relay or fallback.
 func (sh *StreamHandler) writeToStream(pkt *rtp.Packet) {
+	sh.videoMu.Lock()
+	defer sh.videoMu.Unlock()
+
 	defer func() {
 		if r := recover(); r != nil {
 			sh.log.Error("panic writing RTP packet",
@@ -545,11 +580,32 @@ func (sh *StreamHandler) writeToStream(pkt *rtp.Packet) {
 		return
 	}
 
-	// Remap payload type to match our output format (96).
-	// The source camera may use a different dynamic PT.
+	// ── Normalise ────────────────────────────────────────────────
 	pkt.PayloadType = 96
+	pkt.SSRC = sh.videoSSRC
+	pkt.SequenceNumber = sh.videoSeq
+	sh.videoSeq++
 
-	stream.WritePacketRTP(desc.Medias[0], pkt)
+	if !sh.videoInited {
+		sh.videoSrcBase = pkt.Timestamp
+		if sh.videoLastOut == 0 {
+			sh.videoOutBase = 0
+		} else {
+			// Leave a 40 ms gap (~3600 ticks at 90 kHz) between
+			// old and new source — equivalent to one frame at 25 fps.
+			sh.videoOutBase = sh.videoLastOut + 3600
+		}
+		sh.videoInited = true
+	}
+
+	outTS := sh.videoOutBase + (pkt.Timestamp - sh.videoSrcBase)
+	sh.videoLastOut = outTS
+	pkt.Timestamp = outTS
+
+	// ── Write ────────────────────────────────────────────────────
+	if err := stream.WritePacketRTP(desc.Medias[0], pkt); err != nil {
+		sh.log.Debug("video WritePacketRTP error", "error", err)
+	}
 }
 
 // writeAudioToStream safely writes an audio RTP packet to the output server
@@ -777,6 +833,9 @@ func (sh *StreamHandler) startFallback(ctx context.Context) {
 
 	fbCtx, cancel := context.WithCancel(ctx)
 	sh.fallbackCancel = cancel
+	// Reset video timeline so fallback timestamps map smoothly
+	// onto the output timeline the camera was using.
+	sh.resetVideoTimeline()
 	sh.wg.Add(1)
 	sh.fallbackWg.Add(1)
 	go func() {
@@ -993,14 +1052,10 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 
 	// ── Set up RTP encoder ───────────────────────────────────────────
 	//
-	// CRITICAL: we encode each NALU individually to avoid STAP-A
-	// aggregation. gortsplib's rtph264.Encoder packs small NALUs into
-	// STAP-A packets. If ANY intermediary (go2rtc, FFmpeg depayloader)
-	// mishandles STAP-A de-aggregation, the H.264 decoder sees garbage
-	// NAL types → "data partitioning is not implemented" errors.
-	//
-	// By sending each NALU as a separate single-NALU RTP packet, we
-	// use the simplest, most universally compatible RTP format.
+	// Use the standard gortsplib pattern: pass the full access unit to
+	// a single Encode() call. The encoder handles STAP-A (small NALUs),
+	// FU-A (large NALUs), and single-NALU formats per RFC 6184.
+	// PacketizationMode MUST be 1 to match the SDP declaration.
 
 	var h264Enc *rtph264.Encoder
 	var h265Enc *rtph265.Encoder
@@ -1012,7 +1067,11 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 			return
 		}
 	} else {
-		h264Enc = &rtph264.Encoder{PayloadType: 96, PayloadMaxSize: 1200}
+		h264Enc = &rtph264.Encoder{
+			PayloadType:       96,
+			PayloadMaxSize:    1200,
+			PacketizationMode: 1, // must match SDP
+		}
 		if err := h264Enc.Init(); err != nil {
 			sh.log.Error("h264 RTP encoder init", "error", err)
 			return
@@ -1030,8 +1089,8 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 
 	// ── Emission loop ────────────────────────────────────────────────
 	// Re-emit the same pre-encoded access unit at the configured FPS.
-	// Each NALU is sent as a SEPARATE RTP packet (no STAP-A) for
-	// maximum compatibility with all RTSP consumers.
+	// The output normaliser in writeToStream ensures consumers see a
+	// continuous stream with monotonic timestamps.
 
 	ticker := time.NewTicker(time.Second / time.Duration(fps))
 	defer ticker.Stop()
@@ -1045,31 +1104,26 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		}
 
 		if codec == "h265" && h265Enc != nil {
-			// For H.265: encode each NALU individually too.
-			var allPkts []*rtp.Packet
-			for _, nalu := range au {
-				if pkts, err := h265Enc.Encode([][]byte{nalu}); err == nil {
-					allPkts = append(allPkts, pkts...)
-				}
+			pkts, err := h265Enc.Encode(au)
+			if err != nil {
+				sh.log.Error("fallback: H265 encode", "error", err)
+				continue
 			}
-			for i, pkt := range allPkts {
-				pkt.Header.Marker = (i == len(allPkts)-1)
+			for _, pkt := range pkts {
 				pkt.Timestamp = ts
 				sh.writeToStream(pkt)
 			}
 		} else if h264Enc != nil {
-			// Encode each NALU separately → one RTP packet per NALU
-			// (or FU-A fragments for large NALUs). This avoids
-			// STAP-A aggregation entirely.
-			var allPkts []*rtp.Packet
-			for _, nalu := range au {
-				if pkts, err := h264Enc.Encode([][]byte{nalu}); err == nil {
-					allPkts = append(allPkts, pkts...)
-				}
+			// Standard gortsplib pattern: encode the complete access
+			// unit in a single call. The encoder produces the correct
+			// mix of single-NALU / STAP-A / FU-A packets per RFC 6184
+			// and sets the marker bit on the last packet.
+			pkts, err := h264Enc.Encode(au)
+			if err != nil {
+				sh.log.Error("fallback: H264 encode", "error", err)
+				continue
 			}
-			// Marker bit: only on the very last packet of the AU.
-			for i, pkt := range allPkts {
-				pkt.Header.Marker = (i == len(allPkts)-1)
+			for _, pkt := range pkts {
 				pkt.Timestamp = ts
 				sh.writeToStream(pkt)
 			}
