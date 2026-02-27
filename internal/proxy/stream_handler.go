@@ -277,6 +277,27 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 
 	sh.mu.Lock()
 	sh.detectedCodec = codec
+	// Copy source SPS/PPS to the output format so the SDP advertises
+	// sprop-parameter-sets. This lets consumers determine dimensions
+	// without probing the RTP stream.
+	if codec == "h264" {
+		var srcFmt *format.H264
+		if desc.FindFormat(&srcFmt) != nil && srcFmt != nil && srcFmt.SPS != nil {
+			if outFmt, ok := sh.desc.Medias[0].Formats[0].(*format.H264); ok {
+				outFmt.SPS = srcFmt.SPS
+				outFmt.PPS = srcFmt.PPS
+			}
+		}
+	} else if codec == "h265" {
+		var srcFmt *format.H265
+		if desc.FindFormat(&srcFmt) != nil && srcFmt != nil && srcFmt.VPS != nil {
+			if outFmt, ok := sh.desc.Medias[0].Formats[0].(*format.H265); ok {
+				outFmt.VPS = srcFmt.VPS
+				outFmt.SPS = srcFmt.SPS
+				outFmt.PPS = srcFmt.PPS
+			}
+		}
+	}
 	sh.mu.Unlock()
 	sh.log.Info("codec detected", "codec", codec)
 
@@ -540,14 +561,38 @@ func (sh *StreamHandler) runSilenceAudio(ctx context.Context) {
 // -----------------------------------------------------------------------
 
 func (sh *StreamHandler) captureKeyframeH264(au [][]byte) {
+	// Also extract and propagate SPS/PPS to the output format when
+	// we see them from the real camera. This updates the SDP's
+	// sprop-parameter-sets for new consumer sessions.
+	var sps, pps []byte
+	hasIDR := false
+
 	for _, nalu := range au {
 		if len(nalu) == 0 {
 			continue
 		}
-		if nalu[0]&0x1F == 5 { // IDR
-			sh.decodeAndStore(au, "h264")
-			return
+		switch nalu[0] & 0x1F {
+		case 7:
+			sps = nalu
+		case 8:
+			pps = nalu
+		case 5:
+			hasIDR = true
 		}
+	}
+
+	// Update SPS/PPS in the output format.
+	if sps != nil && pps != nil {
+		sh.mu.Lock()
+		if h264Fmt, ok := sh.desc.Medias[0].Formats[0].(*format.H264); ok {
+			h264Fmt.SPS = sps
+			h264Fmt.PPS = pps
+		}
+		sh.mu.Unlock()
+	}
+
+	if hasIDR {
+		sh.decodeAndStore(au, "h264")
 	}
 }
 
@@ -781,20 +826,76 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		return
 	}
 
-	// Log NAL unit details (helps debugging Frigate issues).
-	for i, n := range au {
-		if len(n) == 0 {
+	// ── Classify NALUs and update SDP ────────────────────────────────
+	// Extract SPS/PPS so we can:
+	// 1. Set sprop-parameter-sets in the SDP → consumers know dimensions
+	//    immediately without probing.
+	// 2. Filter out AUD/filler NALUs that some consumers don't expect.
+
+	var sps, pps []byte
+	var filteredAU [][]byte
+	for _, nalu := range au {
+		if len(nalu) == 0 {
 			continue
 		}
-		nalType := n[0] & 0x1F
-		if codec == "h265" && len(n) >= 2 {
-			nalType = (n[0] >> 1) & 0x3F
+		nalType := nalu[0] & 0x1F
+		if codec == "h265" && len(nalu) >= 2 {
+			nalType = (nalu[0] >> 1) & 0x3F
 		}
+
 		sh.log.Info("fallback NAL unit",
-			"idx", i, "type", nalType, "size", len(n))
+			"type", nalType, "size", len(nalu))
+
+		if codec != "h265" {
+			switch nalType {
+			case 7: // SPS
+				sps = nalu
+				filteredAU = append(filteredAU, nalu)
+			case 8: // PPS
+				pps = nalu
+				filteredAU = append(filteredAU, nalu)
+			case 5, 1: // IDR, non-IDR slice
+				filteredAU = append(filteredAU, nalu)
+			case 6: // SEI — include for compatibility
+				filteredAU = append(filteredAU, nalu)
+			// Skip AUD (9), filler (12), and other non-essential NALUs.
+			default:
+				sh.log.Debug("fallback: skipping NALU type", "type", nalType)
+			}
+		} else {
+			// H.265: keep all NALUs
+			filteredAU = append(filteredAU, nalu)
+		}
+	}
+
+	if len(filteredAU) == 0 {
+		sh.log.Error("fallback: no usable NAL units after filtering")
+		return
+	}
+	au = filteredAU
+
+	// Update SDP with SPS/PPS so consumers get sprop-parameter-sets.
+	if codec == "h264" && sps != nil && pps != nil {
+		sh.mu.Lock()
+		if h264Fmt, ok := sh.desc.Medias[0].Formats[0].(*format.H264); ok {
+			h264Fmt.SPS = sps
+			h264Fmt.PPS = pps
+		}
+		sh.mu.Unlock()
+		sh.log.Info("fallback: updated SPS/PPS in SDP",
+			"sps_size", len(sps), "pps_size", len(pps))
 	}
 
 	// ── Set up RTP encoder ───────────────────────────────────────────
+	//
+	// CRITICAL: we encode each NALU individually to avoid STAP-A
+	// aggregation. gortsplib's rtph264.Encoder packs small NALUs into
+	// STAP-A packets. If ANY intermediary (go2rtc, FFmpeg depayloader)
+	// mishandles STAP-A de-aggregation, the H.264 decoder sees garbage
+	// NAL types → "data partitioning is not implemented" errors.
+	//
+	// By sending each NALU as a separate single-NALU RTP packet, we
+	// use the simplest, most universally compatible RTP format.
 
 	var h264Enc *rtph264.Encoder
 	var h265Enc *rtph265.Encoder
@@ -824,8 +925,8 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 
 	// ── Emission loop ────────────────────────────────────────────────
 	// Re-emit the same pre-encoded access unit at the configured FPS.
-	// Each emission is a complete [SPS, PPS, IDR] (or HEVC equivalent)
-	// so consumers can start decoding at any point.
+	// Each NALU is sent as a SEPARATE RTP packet (no STAP-A) for
+	// maximum compatibility with all RTSP consumers.
 
 	ticker := time.NewTicker(time.Second / time.Duration(fps))
 	defer ticker.Stop()
@@ -839,18 +940,33 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		}
 
 		if codec == "h265" && h265Enc != nil {
-			if pkts, err := h265Enc.Encode(au); err == nil {
-				for _, pkt := range pkts {
-					pkt.Timestamp = ts
-					sh.writeToStream(pkt)
+			// For H.265: encode each NALU individually too.
+			var allPkts []*rtp.Packet
+			for _, nalu := range au {
+				if pkts, err := h265Enc.Encode([][]byte{nalu}); err == nil {
+					allPkts = append(allPkts, pkts...)
 				}
 			}
+			for i, pkt := range allPkts {
+				pkt.Header.Marker = (i == len(allPkts)-1)
+				pkt.Timestamp = ts
+				sh.writeToStream(pkt)
+			}
 		} else if h264Enc != nil {
-			if pkts, err := h264Enc.Encode(au); err == nil {
-				for _, pkt := range pkts {
-					pkt.Timestamp = ts
-					sh.writeToStream(pkt)
+			// Encode each NALU separately → one RTP packet per NALU
+			// (or FU-A fragments for large NALUs). This avoids
+			// STAP-A aggregation entirely.
+			var allPkts []*rtp.Packet
+			for _, nalu := range au {
+				if pkts, err := h264Enc.Encode([][]byte{nalu}); err == nil {
+					allPkts = append(allPkts, pkts...)
 				}
+			}
+			// Marker bit: only on the very last packet of the AU.
+			for i, pkt := range allPkts {
+				pkt.Header.Marker = (i == len(allPkts)-1)
+				pkt.Timestamp = ts
+				sh.writeToStream(pkt)
 			}
 		}
 		ts += tsInc
