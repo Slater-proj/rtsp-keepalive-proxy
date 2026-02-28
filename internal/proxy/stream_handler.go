@@ -90,6 +90,12 @@ type StreamHandler struct {
 	initialSPS []byte
 	initialPPS []byte
 
+	// Pre-encoded fallback NAL units. Generated synchronously at init
+	// time so that runFallback can start sending RTP packets within
+	// milliseconds instead of waiting for FFmpeg encoding (seconds).
+	preBaseAU [][]byte // base fallback frame (Access Unit)
+	preDotAU  [][]byte // dot-indicator variant
+
 	// -- RTP output normaliser --
 	// Delivers a single continuous RTP stream (constant SSRC, monotonic
 	// SeqNum, smooth timestamps) to consumers regardless of source
@@ -131,20 +137,25 @@ func NewStreamHandler(name string, cfg config.ResolvedCamera) *StreamHandler {
 			"width", cfg.Width, "height", cfg.Height)
 	}
 
-	// Pre-generate SPS/PPS so the SDP always has sprop-parameter-sets.
-	if codec == "h264" && cfg.FallbackMode != "none" {
-		sh.preGenerateSPSPPS()
+	// Pre-encode fallback frames so the SDP has sprop-parameter-sets
+	// and runFallback can send data within milliseconds.
+	if cfg.FallbackMode != "none" {
+		sh.preEncodeFallback()
 	}
 
 	return sh
 }
 
-// preGenerateSPSPPS runs FFmpeg synchronously to encode one placeholder
-// frame, extracting H.264 SPS/PPS NAL units for the initial SDP.
-func (sh *StreamHandler) preGenerateSPSPPS() {
+// preEncodeFallback runs FFmpeg synchronously to encode the fallback
+// placeholder into H.264 (or H.265) NAL units. Both the base frame and
+// the dot-indicator variant are encoded, so runFallback can start
+// sending RTP packets instantly (no FFmpeg call at runtime).
+func (sh *StreamHandler) preEncodeFallback() {
+	codec := sh.detectedCodec
+
 	pngData, w, h := sh.fallbackGen.GetFramePNG()
 	if len(pngData) == 0 {
-		sh.log.Warn("preGenerateSPSPPS: no PNG available")
+		sh.log.Warn("preEncodeFallback: no PNG available")
 		return
 	}
 
@@ -155,71 +166,44 @@ func (sh *StreamHandler) preGenerateSPSPPS() {
 		h++
 	}
 
-	tmpFile, err := os.CreateTemp("", fmt.Sprintf("init-sps-%s-*.png", sh.Name))
-	if err != nil {
-		sh.log.Warn("preGenerateSPSPPS: temp file", "error", err)
-		return
-	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-
-	if _, err := tmpFile.Write(pngData); err != nil {
-		tmpFile.Close()
-		sh.log.Warn("preGenerateSPSPPS: write temp file", "error", err)
-		return
-	}
-	tmpFile.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "ffmpeg",
-		"-hide_banner", "-loglevel", "error",
-		"-i", tmpPath,
-		"-c:v", "libx264",
-		"-frames:v", "1",
-		"-preset", "ultrafast",
-		"-profile:v", "baseline",
-		"-level", "3.1",
-		"-x264-params", "keyint=1:min-keyint=1:scenecut=0:bframes=0:repeat-headers=1",
-		"-s", fmt.Sprintf("%dx%d", w, h),
-		"-pix_fmt", "yuv420p",
-		"-f", "h264",
-		"pipe:1",
-	)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	output, err := cmd.Output()
-	if err != nil {
-		sh.log.Warn("preGenerateSPSPPS: FFmpeg failed",
-			"error", err, "stderr", stderr.String())
+	// Encode base frame.
+	baseAU, sps, pps := sh.encodePNGToAU(pngData, w, h, codec)
+	if len(baseAU) == 0 {
+		sh.log.Warn("preEncodeFallback: base frame encoding failed")
 		return
 	}
 
-	nalus := fallback.ParseAnnexB(output)
-	for _, nalu := range nalus {
-		if len(nalu) == 0 {
-			continue
-		}
-		switch nalu[0] & 0x1F {
-		case 7:
-			sh.initialSPS = make([]byte, len(nalu))
-			copy(sh.initialSPS, nalu)
-		case 8:
-			sh.initialPPS = make([]byte, len(nalu))
-			copy(sh.initialPPS, nalu)
+	// Store SPS/PPS for the SDP.
+	if codec != "h265" && sps != nil && pps != nil {
+		sh.initialSPS = copyBytes(sps)
+		sh.initialPPS = copyBytes(pps)
+	}
+
+	// Deep-copy the NALUs so they're fully owned.
+	sh.preBaseAU = make([][]byte, len(baseAU))
+	for i, nalu := range baseAU {
+		sh.preBaseAU[i] = copyBytes(nalu)
+	}
+
+	// Encode dot-indicator variant.
+	dotPng := addIndicatorDot(pngData)
+	if dotPng != nil {
+		dotAU, _, _ := sh.encodePNGToAU(dotPng, w, h, codec)
+		if len(dotAU) > 0 {
+			sh.preDotAU = make([][]byte, len(dotAU))
+			for i, nalu := range dotAU {
+				sh.preDotAU[i] = copyBytes(nalu)
+			}
 		}
 	}
 
-	if sh.initialSPS != nil && sh.initialPPS != nil {
-		sh.log.Info("pre-generated SPS/PPS for SDP",
-			"sps_size", len(sh.initialSPS),
-			"pps_size", len(sh.initialPPS),
-			"frame", fmt.Sprintf("%dx%d", w, h))
-	} else {
-		sh.log.Warn("preGenerateSPSPPS: could not extract SPS/PPS")
-	}
+	sh.log.Info("pre-encoded fallback frames",
+		"codec", codec,
+		"sps_len", len(sh.initialSPS),
+		"pps_len", len(sh.initialPPS),
+		"base_nalus", len(sh.preBaseAU),
+		"dot_nalus", len(sh.preDotAU),
+		"size", fmt.Sprintf("%dx%d", w, h))
 }
 
 // GetState returns the current camera state.
@@ -1137,56 +1121,57 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		fps = 5
 	}
 
-	pngData, w, h := sh.fallbackGen.GetFramePNG()
-	if len(pngData) == 0 {
-		sh.log.Error("no fallback frame available")
-		return
-	}
+	// ---------------------------------------------------------------
+	// Use pre-encoded frames for instant startup (no FFmpeg delay).
+	// Falls back to on-the-fly encoding only if pre-encoding failed.
+	// ---------------------------------------------------------------
+	var frameVariants [][][]byte
 
-	if w%2 != 0 {
-		w++
-	}
-	if h%2 != 0 {
-		h++
-	}
+	if len(sh.preBaseAU) > 0 {
+		// Fast path: pre-encoded during init, zero latency.
+		frameVariants = append(frameVariants, sh.preBaseAU)
+		if len(sh.preDotAU) > 0 {
+			frameVariants = append(frameVariants, sh.preDotAU)
+		}
+		sh.log.Info("fallback: using pre-encoded frames")
+	} else {
+		// Slow path: encode on-the-fly (should rarely happen).
+		sh.log.Warn("fallback: no pre-encoded frames, encoding on-the-fly")
 
-	// Encode base frame.
-	baseAU, sps, pps := sh.encodePNGToAU(pngData, w, h, codec)
-	if len(baseAU) == 0 {
-		sh.log.Error("fallback: no NAL units from base frame")
-		return
+		pngData, w, h := sh.fallbackGen.GetFramePNG()
+		if len(pngData) == 0 {
+			sh.log.Error("no fallback frame available")
+			return
+		}
+		if w%2 != 0 {
+			w++
+		}
+		if h%2 != 0 {
+			h++
+		}
+
+		baseAU, _, _ := sh.encodePNGToAU(pngData, w, h, codec)
+		if len(baseAU) == 0 {
+			sh.log.Error("fallback: no NAL units from base frame")
+			return
+		}
+		frameVariants = append(frameVariants, baseAU)
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		dotPng := addIndicatorDot(pngData)
+		if dotPng != nil {
+			dotAU, _, _ := sh.encodePNGToAU(dotPng, w, h, codec)
+			if len(dotAU) > 0 {
+				frameVariants = append(frameVariants, dotAU)
+			}
+		}
 	}
 
 	if ctx.Err() != nil {
 		return
-	}
-
-	// Build frame variants: base frame + dot-indicator frame for animation.
-	// The indicator is a tiny (6x6 px) dot in the bottom-right corner,
-	// far too small to trigger motion detection but visible to humans
-	// as proof the stream is alive.
-	frameVariants := [][][]byte{baseAU}
-
-	dotPng := addIndicatorDot(pngData)
-	if dotPng != nil {
-		dotAU, _, _ := sh.encodePNGToAU(dotPng, w, h, codec)
-		if len(dotAU) > 0 {
-			frameVariants = append(frameVariants, dotAU)
-		}
-	}
-
-	// Update SDP with SPS/PPS.
-	if codec == "h264" && sps != nil && pps != nil {
-		sh.mu.Lock()
-		if sh.desc != nil && len(sh.desc.Medias) > 0 {
-			if h264Fmt, ok := sh.desc.Medias[0].Formats[0].(*format.H264); ok {
-				h264Fmt.SPS = sps
-				h264Fmt.PPS = pps
-			}
-		}
-		sh.mu.Unlock()
-		sh.log.Info("fallback: updated SPS/PPS in SDP",
-			"sps_size", len(sps), "pps_size", len(pps))
 	}
 
 	// Set up RTP encoder.
@@ -1225,7 +1210,6 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 
 	sh.log.Info("fallback stream started",
 		"codec", codec, "fps", fps,
-		"size", fmt.Sprintf("%dx%d", w, h),
 		"variants", len(frameVariants))
 
 	ticker := time.NewTicker(time.Second / time.Duration(fps))
