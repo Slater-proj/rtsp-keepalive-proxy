@@ -108,6 +108,11 @@ type StreamHandler struct {
 	videoInited  bool
 	videoMu      sync.Mutex // serialises all video writes
 
+	// -- Audio RTP normaliser --
+	audioSSRC uint32
+	audioSeq  uint16
+	audioMu   sync.Mutex
+
 	// Lifecycle
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -129,6 +134,7 @@ func NewStreamHandler(name string, cfg config.ResolvedCamera) *StreamHandler {
 	}
 	sh.state.Store(int32(StateDisconnected))
 	sh.videoSSRC = 0x46414C4C // "FALL" -- constant across source switches
+	sh.audioSSRC = 0x41554449 // "AUDI" -- constant across source switches
 
 	// Apply configured resolution hints to the fallback generator.
 	if cfg.Width > 0 && cfg.Height > 0 {
@@ -255,11 +261,22 @@ func (sh *StreamHandler) BuildDescription() *description.Session {
 		}
 	}
 
+	af := &format.G711{
+		PayloadTyp:   8,
+		MULaw:        false,
+		SampleRate:   8000,
+		ChannelCount: 1,
+	}
+
 	sh.desc = &description.Session{
 		Medias: []*description.Media{
 			{
 				Type:    description.MediaTypeVideo,
 				Formats: []format.Format{vf},
+			},
+			{
+				Type:    description.MediaTypeAudio,
+				Formats: []format.Format{af},
 			},
 		},
 	}
@@ -429,7 +446,18 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 	}
 
 	if _, err := c.Setup(srcDesc.BaseURL, videoMedia, 0, 0); err != nil {
-		return fmt.Errorf("setup: %w", err)
+		return fmt.Errorf("setup video: %w", err)
+	}
+
+	// Also setup audio if the camera offers it.
+	audioMedia := sh.findAudioMedia(srcDesc)
+	if audioMedia != nil {
+		if _, err := c.Setup(srcDesc.BaseURL, audioMedia, 0, 0); err != nil {
+			sh.log.Warn("audio setup failed, continuing video-only", "error", err)
+			audioMedia = nil
+		} else {
+			sh.log.Info("camera audio track set up")
+		}
 	}
 
 	if ctx.Err() != nil {
@@ -453,7 +481,7 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 	// parameters" or produce garbage frames.
 
 	// Register RTP callback with decode+re-encode.
-	sh.registerCallback(c, srcDesc, &lastPktTime, &lastPktTimeMu)
+	sh.registerCallback(c, srcDesc, audioMedia, &lastPktTime, &lastPktTimeMu)
 
 	if _, err := c.Play(nil); err != nil {
 		return fmt.Errorf("play: %w", err)
@@ -495,6 +523,15 @@ func (sh *StreamHandler) findVideoMedia(desc *description.Session) (*description
 	return nil, ""
 }
 
+func (sh *StreamHandler) findAudioMedia(desc *description.Session) *description.Media {
+	for _, m := range desc.Medias {
+		if m.Type == description.MediaTypeAudio {
+			return m
+		}
+	}
+	return nil
+}
+
 // registerCallback sets up the RTP callback that DECODES camera RTP packets
 // into NAL units, then RE-ENCODES them using our own encoder. This guarantees
 // every output packet exactly matches our SDP format (PacketizationMode=1,
@@ -504,6 +541,7 @@ func (sh *StreamHandler) findVideoMedia(desc *description.Session) (*description
 func (sh *StreamHandler) registerCallback(
 	c *gortsplib.Client,
 	desc *description.Session,
+	audioMedia *description.Media,
 	lastPktTime *time.Time,
 	lastPktTimeMu *sync.Mutex,
 ) {
@@ -536,6 +574,7 @@ func (sh *StreamHandler) registerCallback(
 		camSPS := copyBytes(h264f.SPS)
 		camPPS := copyBytes(h264f.PPS)
 		seenIDR := false
+		silenceStopped := false
 
 		c.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
 			defer func() {
@@ -547,6 +586,17 @@ func (sh *StreamHandler) registerCallback(
 			lastPktTimeMu.Lock()
 			*lastPktTime = time.Now()
 			lastPktTimeMu.Unlock()
+
+			// Forward audio packets from the camera.
+			if audioMedia != nil && medi == audioMedia {
+				if !silenceStopped {
+					sh.stopSilenceAudio()
+					silenceStopped = true
+					sh.log.Info("camera audio detected, silence stopped")
+				}
+				sh.writeAudioToStream(pkt)
+				return
+			}
 
 			au, err := dec.Decode(pkt)
 			if err != nil || au == nil {
@@ -640,6 +690,7 @@ func (sh *StreamHandler) registerCallback(
 		camSPS := copyBytes(h265f.SPS)
 		camPPS := copyBytes(h265f.PPS)
 		seenIRAP := false
+		silenceStopped := false
 
 		c.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
 			defer func() {
@@ -651,6 +702,17 @@ func (sh *StreamHandler) registerCallback(
 			lastPktTimeMu.Lock()
 			*lastPktTime = time.Now()
 			lastPktTimeMu.Unlock()
+
+			// Forward audio packets from the camera.
+			if audioMedia != nil && medi == audioMedia {
+				if !silenceStopped {
+					sh.stopSilenceAudio()
+					silenceStopped = true
+					sh.log.Info("camera audio detected, silence stopped")
+				}
+				sh.writeAudioToStream(pkt)
+				return
+			}
 
 			au, err := dec.Decode(pkt)
 			if err != nil || au == nil {
@@ -854,9 +916,13 @@ func (sh *StreamHandler) writeToStream(pkt *rtp.Packet) {
 	}
 }
 
-// writeAudioToStream safely writes an audio RTP packet to the output server
-// stream (media index 1 = audio).
+// writeAudioToStream normalises and writes an audio RTP packet to the output
+// server stream (media index 1 = audio). Constant SSRC and monotonic sequence
+// numbers are enforced so source switches (silence ↔ camera) are seamless.
 func (sh *StreamHandler) writeAudioToStream(pkt *rtp.Packet) {
+	sh.audioMu.Lock()
+	defer sh.audioMu.Unlock()
+
 	defer func() {
 		if r := recover(); r != nil {
 			sh.log.Error("panic writing audio RTP packet",
@@ -874,6 +940,10 @@ func (sh *StreamHandler) writeAudioToStream(pkt *rtp.Packet) {
 	if stream == nil || desc == nil || len(desc.Medias) < 2 {
 		return
 	}
+
+	pkt.SSRC = sh.audioSSRC
+	pkt.SequenceNumber = sh.audioSeq
+	sh.audioSeq++
 
 	stream.WritePacketRTP(desc.Medias[1], pkt)
 }
@@ -1082,6 +1152,10 @@ func (sh *StreamHandler) startFallback(ctx context.Context) {
 	fbCtx, cancel := context.WithCancel(ctx)
 	sh.fallbackCancel = cancel
 	sh.resetVideoTimeline()
+
+	// Start silence audio alongside fallback video.
+	sh.startSilenceAudio(ctx)
+
 	sh.wg.Add(1)
 	sh.fallbackWg.Add(1)
 	go func() {
