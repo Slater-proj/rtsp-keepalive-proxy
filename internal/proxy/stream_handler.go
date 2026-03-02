@@ -86,7 +86,8 @@ type StreamHandler struct {
 	// Rate-limiting keyframe captures (unix seconds).
 	lastCaptureTS atomic.Int64
 
-	// Pre-generated SPS/PPS for the initial SDP.
+	// Pre-generated parameter sets for the initial SDP.
+	initialVPS []byte // H.265 only
 	initialSPS []byte
 	initialPPS []byte
 
@@ -183,14 +184,24 @@ func (sh *StreamHandler) preEncodeFallback() {
 	}
 
 	// Encode base frame.
-	baseAU, sps, pps := sh.encodePNGToAU(pngData, w, h, codec)
+	baseAU, vps, sps, pps := sh.encodePNGToAU(pngData, w, h, codec)
 	if len(baseAU) == 0 {
 		sh.log.Warn("preEncodeFallback: base frame encoding failed")
 		return
 	}
 
-	// Store SPS/PPS for the SDP.
-	if codec != "h265" && sps != nil && pps != nil {
+	// Store parameter sets for the SDP.
+	if codec == "h265" {
+		if vps != nil {
+			sh.initialVPS = copyBytes(vps)
+		}
+		if sps != nil {
+			sh.initialSPS = copyBytes(sps)
+		}
+		if pps != nil {
+			sh.initialPPS = copyBytes(pps)
+		}
+	} else if sps != nil && pps != nil {
 		sh.initialSPS = copyBytes(sps)
 		sh.initialPPS = copyBytes(pps)
 	}
@@ -204,7 +215,7 @@ func (sh *StreamHandler) preEncodeFallback() {
 	// Encode dot-indicator variant.
 	dotPng := addIndicatorDot(pngData)
 	if dotPng != nil {
-		dotAU, _, _ := sh.encodePNGToAU(dotPng, w, h, codec)
+		dotAU, _, _, _ := sh.encodePNGToAU(dotPng, w, h, codec)
 		if len(dotAU) > 0 {
 			sh.preDotAU = make([][]byte, len(dotAU))
 			for i, nalu := range dotAU {
@@ -215,6 +226,7 @@ func (sh *StreamHandler) preEncodeFallback() {
 
 	sh.log.Info("pre-encoded fallback frames",
 		"codec", codec,
+		"vps_len", len(sh.initialVPS),
 		"sps_len", len(sh.initialSPS),
 		"pps_len", len(sh.initialPPS),
 		"base_nalus", len(sh.preBaseAU),
@@ -261,7 +273,12 @@ func (sh *StreamHandler) BuildDescription() *description.Session {
 
 	var vf format.Format
 	if sh.detectedCodec == "h265" {
-		vf = &format.H265{PayloadTyp: 96}
+		vf = &format.H265{
+			PayloadTyp: 96,
+			VPS:        sh.initialVPS,
+			SPS:        sh.initialSPS,
+			PPS:        sh.initialPPS,
+		}
 	} else {
 		vf = &format.H264{
 			PayloadTyp:        96,
@@ -292,9 +309,18 @@ func (sh *StreamHandler) BuildDescription() *description.Session {
 	}
 
 	// Log SDP readiness so operators can verify sprop-parameter-sets.
-	if sh.detectedCodec != "h265" {
+	if sh.detectedCodec == "h265" {
+		if h, ok := vf.(*format.H265); ok {
+			sh.log.Info("SDP built",
+				"codec", "h265",
+				"has_vps", h.VPS != nil,
+				"has_sps", h.SPS != nil,
+				"has_pps", h.PPS != nil)
+		}
+	} else {
 		if h, ok := vf.(*format.H264); ok {
 			sh.log.Info("SDP built",
+				"codec", "h264",
 				"has_sps", h.SPS != nil,
 				"has_pps", h.PPS != nil,
 				"sps_len", len(h.SPS),
@@ -1331,7 +1357,7 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 			h++
 		}
 
-		baseAU, _, _ := sh.encodePNGToAU(pngData, w, h, codec)
+		baseAU, _, _, _ := sh.encodePNGToAU(pngData, w, h, codec)
 		if len(baseAU) == 0 {
 			sh.log.Error("fallback: no NAL units from base frame")
 			return
@@ -1344,7 +1370,7 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 
 		dotPng := addIndicatorDot(pngData)
 		if dotPng != nil {
-			dotAU, _, _ := sh.encodePNGToAU(dotPng, w, h, codec)
+			dotAU, _, _, _ := sh.encodePNGToAU(dotPng, w, h, codec)
 			if len(dotAU) > 0 {
 				frameVariants = append(frameVariants, dotAU)
 			}
@@ -1438,19 +1464,19 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 }
 
 // encodePNGToAU encodes PNG data to H.264/H.265 NAL units via FFmpeg.
-// Returns the filtered access unit, plus SPS and PPS (H.264 only).
-func (sh *StreamHandler) encodePNGToAU(pngData []byte, w, h int, codec string) (au [][]byte, sps, pps []byte) {
+// Returns the filtered access unit, plus VPS (H.265 only), SPS, and PPS.
+func (sh *StreamHandler) encodePNGToAU(pngData []byte, w, h int, codec string) (au [][]byte, vps, sps, pps []byte) {
 	tmpFile, err := os.CreateTemp("", fmt.Sprintf("fb-enc-%s-*.png", sh.Name))
 	if err != nil {
 		sh.log.Error("encodePNGToAU: temp file", "error", err)
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 
 	if _, err := tmpFile.Write(pngData); err != nil {
 		tmpFile.Close()
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	tmpFile.Close()
 
@@ -1500,7 +1526,7 @@ func (sh *StreamHandler) encodePNGToAU(pngData []byte, w, h int, codec string) (
 	if err != nil {
 		sh.log.Error("encodePNGToAU: FFmpeg failed",
 			"error", err, "stderr", stderr.String())
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	nalus := fallback.ParseAnnexB(output)
@@ -1508,7 +1534,20 @@ func (sh *StreamHandler) encodePNGToAU(pngData []byte, w, h int, codec string) (
 		if len(nalu) == 0 {
 			continue
 		}
-		if codec != "h265" {
+		if codec == "h265" {
+			if len(nalu) >= 2 {
+				nt := (nalu[0] >> 1) & 0x3F
+				switch nt {
+				case 32:
+					vps = nalu
+				case 33:
+					sps = nalu
+				case 34:
+					pps = nalu
+				}
+			}
+			au = append(au, nalu)
+		} else {
 			switch nalu[0] & 0x1F {
 			case 7:
 				sps = nalu
@@ -1521,11 +1560,9 @@ func (sh *StreamHandler) encodePNGToAU(pngData []byte, w, h int, codec string) (
 			default:
 				// Skip AUD, filler, etc.
 			}
-		} else {
-			au = append(au, nalu)
 		}
 	}
-	return au, sps, pps
+	return au, vps, sps, pps
 }
 
 // addIndicatorDot overlays a tiny (6x6 px) semi-transparent dot in the
