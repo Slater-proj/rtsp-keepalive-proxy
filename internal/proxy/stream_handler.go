@@ -781,6 +781,9 @@ func (sh *StreamHandler) registerCallback(
 			if len(au) == 0 {
 				return
 			}
+			if !hasH265VCL(au) {
+				return // No picture data -- skip entirely
+			}
 
 			if !seenIRAP {
 				hasIRAP := false
@@ -1568,6 +1571,21 @@ func hasVCL(au [][]byte) bool {
 		if len(nalu) > 0 {
 			nt := nalu[0] & 0x1F
 			if nt == 1 || nt == 5 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasH265VCL returns true if the AU contains at least one H.265 VCL NALU
+// (types 0-31). AUs with only parameter sets (VPS/SPS/PPS) or SEI would
+// confuse downstream muxers/decoders.
+func hasH265VCL(au [][]byte) bool {
+	for _, nalu := range au {
+		if len(nalu) >= 2 {
+			nt := (nalu[0] >> 1) & 0x3F
+			if nt <= 31 {
 				return true
 			}
 		}
