@@ -96,7 +96,7 @@ cameras:
     battery_mode: true
     retry_interval: 3s
     timeout: 10s
-    fallback_fps: 1
+    fallback_fps: 5
     fallback_mode: offline  # override per camera
     codec: auto
 ```

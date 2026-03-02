@@ -113,9 +113,15 @@ type StreamHandler struct {
 	videoMu      sync.Mutex // serialises all video writes
 
 	// -- Audio RTP normaliser --
-	audioSSRC uint32
-	audioSeq  uint16
-	audioMu   sync.Mutex
+	// Mirrors the video normaliser: constant SSRC, monotonic SeqNum,
+	// and smooth timestamps across silence ↔ camera source switches.
+	audioSSRC    uint32
+	audioSeq     uint16
+	audioSrcBase uint32 // first RTP TS from current audio source
+	audioOutBase uint32 // output TS corresponding to audioSrcBase
+	audioLastOut uint32 // last emitted output audio TS
+	audioInited  bool
+	audioMu      sync.Mutex
 
 	// Lifecycle
 	cancel context.CancelFunc
@@ -244,11 +250,11 @@ func (sh *StreamHandler) SetStream(stream *gortsplib.ServerStream) {
 	sh.stream = stream
 }
 
-// BuildDescription returns a session description matching the expected codec.
-// Video-only: no audio track is advertised. Battery cameras typically use
-// G.711 (pcm_alaw) which cannot be muxed into MP4 containers. Omitting
-// audio entirely avoids "Could not find tag for codec pcm_alaw" errors
-// in Frigate's recording FFmpeg.
+// BuildDescription returns a session description for the output stream.
+// Includes one video track (H.264 or H.265 depending on detected codec)
+// and one audio track (G.711 a-law / PCMA). The audio track carries
+// camera audio when online, and continuous silence when in fallback mode,
+// so Frigate/go2rtc always sees a stable audio+video stream.
 func (sh *StreamHandler) BuildDescription() *description.Session {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -649,6 +655,7 @@ func (sh *StreamHandler) registerCallback(
 			if audioMedia != nil && medi == audioMedia {
 				if !silenceStopped {
 					sh.stopSilenceAudio()
+					sh.resetAudioTimeline()
 					silenceStopped = true
 					sh.log.Info("camera audio detected, silence stopped")
 				}
@@ -765,6 +772,7 @@ func (sh *StreamHandler) registerCallback(
 			if audioMedia != nil && medi == audioMedia {
 				if !silenceStopped {
 					sh.stopSilenceAudio()
+					sh.resetAudioTimeline()
 					silenceStopped = true
 					sh.log.Info("camera audio detected, silence stopped")
 				}
@@ -923,6 +931,15 @@ func (sh *StreamHandler) resetVideoTimeline() {
 	sh.videoInited = false
 }
 
+// resetAudioTimeline is called whenever the audio source changes
+// (silence -> camera audio or camera audio -> silence). Mirrors
+// resetVideoTimeline for the audio RTP normaliser.
+func (sh *StreamHandler) resetAudioTimeline() {
+	sh.audioMu.Lock()
+	defer sh.audioMu.Unlock()
+	sh.audioInited = false
+}
+
 // writeToStream normalises an RTP packet and writes it to the output
 // server stream. All output packets share a single SSRC with monotonic
 // sequence numbers and a smooth timestamp timeline, regardless of
@@ -1007,7 +1024,29 @@ func (sh *StreamHandler) writeAudioToStream(pkt *rtp.Packet) {
 	pkt.SequenceNumber = sh.audioSeq
 	sh.audioSeq++
 
-	stream.WritePacketRTP(desc.Medias[1], pkt)
+	// Normalise audio timestamps so source switches (silence ↔ camera)
+	// produce a smooth, monotonic timeline. Without this, downstream
+	// muxers (FFmpeg recording) see PTS discontinuities and fail to
+	// create valid MP4 segments.
+	if !sh.audioInited {
+		sh.audioSrcBase = pkt.Timestamp
+		if sh.audioLastOut == 0 {
+			sh.audioOutBase = 0
+		} else {
+			// Leave a 20 ms gap (160 samples at 8 kHz) between
+			// old and new audio source.
+			sh.audioOutBase = sh.audioLastOut + 160
+		}
+		sh.audioInited = true
+	}
+
+	outTS := sh.audioOutBase + (pkt.Timestamp - sh.audioSrcBase)
+	sh.audioLastOut = outTS
+	pkt.Timestamp = outTS
+
+	if err := stream.WritePacketRTP(desc.Medias[1], pkt); err != nil {
+		sh.log.Debug("audio WritePacketRTP error", "error", err)
+	}
 }
 
 // -----------------------------------------------------------------------
@@ -1214,6 +1253,7 @@ func (sh *StreamHandler) startFallback(ctx context.Context) {
 	fbCtx, cancel := context.WithCancel(ctx)
 	sh.fallbackCancel = cancel
 	sh.resetVideoTimeline()
+	sh.resetAudioTimeline()
 
 	// Start silence audio alongside fallback video.
 	sh.startSilenceAudio(ctx)
@@ -1255,6 +1295,11 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 	fps := sh.cfg.FallbackFPS
 	if fps <= 0 {
 		fps = 5
+	}
+	// Floor: below 2 FPS, FFmpeg recording may fail to create valid
+	// segments because the data rate is too low for the muxer.
+	if fps < 2 {
+		fps = 2
 	}
 
 	// ---------------------------------------------------------------
