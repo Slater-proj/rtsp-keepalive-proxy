@@ -9,6 +9,7 @@ import (
 
 	"github.com/bluenviron/gortsplib/v4"
 	"github.com/bluenviron/gortsplib/v4/pkg/base"
+	"github.com/bluenviron/gortsplib/v4/pkg/description"
 )
 
 // Server is the output RTSP server that Frigate (or any consumer) connects to.
@@ -49,6 +50,22 @@ func (s *Server) Start() error {
 		s.mu.Unlock()
 
 		handler.SetStream(stream)
+
+		// Set rebuild callback for runtime codec changes (auto-detection).
+		streamName := name // capture for closure
+		handler.SetRebuildCallback(func(newDesc *description.Session) *gortsplib.ServerStream {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+
+			if oldStream := s.streams[streamName]; oldStream != nil {
+				oldStream.Close()
+			}
+			newStream := gortsplib.NewServerStream(s.rtsp, newDesc)
+			s.streams[streamName] = newStream
+			slog.Info("stream rebuilt for codec change", "path", "/"+streamName)
+			return newStream
+		})
+
 		slog.Info("rtsp output stream ready", "path", "/"+name)
 	}
 

@@ -96,6 +96,10 @@ type StreamHandler struct {
 	preBaseAU [][]byte // base fallback frame (Access Unit)
 	preDotAU  [][]byte // dot-indicator variant
 
+	// Callback to rebuild the server stream when the detected codec changes
+	// at runtime (e.g. camera SDP reveals H.265 but initial SDP was H.264).
+	rebuildCb func(*description.Session) *gortsplib.ServerStream
+
 	// -- RTP output normaliser --
 	// Delivers a single continuous RTP stream (constant SSRC, monotonic
 	// SeqNum, smooth timestamps) to consumers regardless of source
@@ -295,6 +299,50 @@ func (sh *StreamHandler) BuildDescription() *description.Session {
 	return sh.desc
 }
 
+// SetRebuildCallback registers the function called when the output server
+// stream must be rebuilt (e.g. codec auto-detection switches H.264↔H.265).
+func (sh *StreamHandler) SetRebuildCallback(cb func(*description.Session) *gortsplib.ServerStream) {
+	sh.rebuildCb = cb
+}
+
+// rebuildForCodec handles a runtime codec change: stops current output,
+// re-encodes fallback frames with the new codec, rebuilds the description
+// and server stream, then restarts fallback.
+func (sh *StreamHandler) rebuildForCodec(ctx context.Context, newCodec string) {
+	sh.log.Info("codec change detected, rebuilding stream",
+		"old_codec", sh.detectedCodec, "new_codec", newCodec)
+
+	// Stop current output producers.
+	sh.stopFallback()
+	sh.stopSilenceAudio()
+
+	// Update codec.
+	sh.mu.Lock()
+	sh.detectedCodec = newCodec
+	sh.mu.Unlock()
+
+	// Re-encode fallback frames with the new codec (sets initialSPS/PPS).
+	sh.preEncodeFallback()
+
+	// Rebuild SDP and server stream.
+	newDesc := sh.BuildDescription()
+	if sh.rebuildCb != nil {
+		// Clear stream to block writes during transition.
+		sh.mu.Lock()
+		sh.stream = nil
+		sh.mu.Unlock()
+
+		newStream := sh.rebuildCb(newDesc)
+
+		sh.mu.Lock()
+		sh.stream = newStream
+		sh.mu.Unlock()
+	}
+
+	// Restart fallback (with new codec) so consumers have data immediately.
+	sh.startFallback(ctx)
+}
+
 // Start begins the connection/relay/fallback loop.
 func (sh *StreamHandler) Start(ctx context.Context) {
 	ctx, sh.cancel = context.WithCancel(ctx)
@@ -406,6 +454,16 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 	videoMedia, codec := sh.findVideoMedia(srcDesc)
 	if videoMedia == nil {
 		return fmt.Errorf("no H.264/H.265 video track found")
+	}
+
+	// If the camera's actual codec differs from what the SDP was built with
+	// (e.g. SDP=H.264 but camera=H.265), rebuild the entire server stream
+	// so consumers get the correct SDP and codec.
+	sh.mu.RLock()
+	currentCodec := sh.detectedCodec
+	sh.mu.RUnlock()
+	if codec != currentCodec {
+		sh.rebuildForCodec(ctx, codec)
 	}
 
 	sh.mu.Lock()
@@ -942,6 +1000,7 @@ func (sh *StreamHandler) writeAudioToStream(pkt *rtp.Packet) {
 	}
 
 	pkt.SSRC = sh.audioSSRC
+	pkt.PayloadType = 8 // G.711 a-law (must match SDP)
 	pkt.SequenceNumber = sh.audioSeq
 	sh.audioSeq++
 
