@@ -6,39 +6,62 @@ server:
   # Log level: debug, info, warn, error
   log_level: info
 
-# Default values applied to all cameras unless overridden
+# Default values applied to all cameras unless overridden per-camera.
 defaults:
   # Enable battery/wifi mode (fallback when camera sleeps)
   battery_mode: true
   # Interval between reconnection attempts
-  retry_interval: 3s
+  retry_interval: 1s
   # Duration without packets before camera is considered asleep
-  timeout: 10s
-  # FPS of the fallback still-image stream
+  timeout: 5s
+  # FPS of the fallback still-image stream (min 2)
   fallback_fps: 5
   # What to show when camera sleeps:
   #   offline    — dark frame with "OFFLINE – <camera>" overlay (default)
   #   last_frame — last captured keyframe from the camera
   #   none       — no fallback stream (Frigate sees a disconnect)
   fallback_mode: offline
-  # Codec: auto (detect from source), h264, h265
+  # Video codec: auto (detect from camera SDP), h264, h265
   codec: auto
 
 # Each entry creates an RTSP output path: rtsp://<proxy>:<port>/<name>
 # If source_low is set, a second path is created: rtsp://<proxy>:<port>/low_<name>
 cameras:
+  # ── Dahua battery camera example (H.265 main + H.264 sub) ──────────
   jardin:
     source: "rtsp://${CAM_USER}:${CAM_PASS_JARDIN}@192.168.1.50:554/cam/realmonitor?channel=1&subtype=0"
     source_low: "rtsp://${CAM_USER}:${CAM_PASS_JARDIN}@192.168.1.50:554/cam/realmonitor?channel=1&subtype=1"
-    battery_mode: true
-    retry_interval: 3s
-    timeout: 10s
-    fallback_fps: 5
+    # Set explicit codecs to avoid rebuild on first connection:
+    #   main stream (subtype=0) = H.265
+    #   sub  stream (subtype=1) = H.264
+    codec: h265
+    codec_low: h264
+    # Resolution hints for fallback frames (before camera first connects).
+    # Main stream:
+    width: 1920
+    height: 1080
+    # Low stream:
+    width_low: 640
+    height_low: 480
+    # Per-camera overrides (all optional — inherits from defaults):
+    # battery_mode: true
+    # retry_interval: 1s
+    # timeout: 5s
+    # fallback_fps: 5
+    # fallback_mode: offline
 
   entree:
     source: "rtsp://${CAM_USER}:${CAM_PASS_ENTREE}@192.168.1.52:554/cam/realmonitor?channel=1&subtype=0"
     source_low: "rtsp://${CAM_USER}:${CAM_PASS_ENTREE}@192.168.1.52:554/cam/realmonitor?channel=1&subtype=1"
-    battery_mode: true
-    retry_interval: 3s
-    timeout: 10s
-    fallback_fps: 5
+    codec: h265
+    codec_low: h264
+    width: 1920
+    height: 1080
+    width_low: 640
+    height_low: 480
+
+  # ── Single-stream camera example (H.264 only) ──────────────────────
+  # salon:
+  #   source: "rtsp://user:pass@192.168.1.60:554/stream"
+  #   battery_mode: false       # wired camera, no sleep detection
+  #   codec: h264

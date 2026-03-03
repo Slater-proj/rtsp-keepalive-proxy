@@ -56,11 +56,13 @@ cameras:
   Camera_Jardin:
     ffmpeg:
       inputs:
-        - path: rtsp://rtsp-proxy:8554/low_jardin   # detect
+        - path: rtsp://rtsp-proxy:8554/low_jardin   # detect (H.264 sub stream)
           roles: [detect]
-        - path: rtsp://rtsp-proxy:8554/jardin        # record
+        - path: rtsp://rtsp-proxy:8554/jardin        # record (H.265 main stream)
           input_args: preset-rtsp-restream
           roles: [record]
+      output_args:
+        record: preset-record-generic-audio-aac
 
   Camera_Entree:
     ffmpeg:
@@ -70,6 +72,8 @@ cameras:
         - path: rtsp://rtsp-proxy:8554/entree
           input_args: preset-rtsp-restream
           roles: [record]
+      output_args:
+        record: preset-record-generic-audio-aac
 ```
 
 ## Configuration Reference
@@ -82,24 +86,42 @@ server:
 
 defaults:
   battery_mode: true      # Enable sleep detection + fallback
-  retry_interval: 3s      # Time between reconnection attempts
-  timeout: 10s            # No-packet duration before declaring sleep
-  fallback_fps: 5         # FPS of the still-image fallback stream
+  retry_interval: 1s      # Time between reconnection attempts
+  timeout: 5s             # No-packet duration before declaring sleep
+  fallback_fps: 5         # FPS of the still-image fallback stream (min 2)
   fallback_mode: offline  # offline | last_frame | none
   codec: auto             # auto | h264 | h265
 
 cameras:
   my_camera:
     source: "rtsp://user:pass@ip:554/stream"
-    source_low: "rtsp://user:pass@ip:554/stream_low"  # optional
-    # Per-camera overrides (all optional):
+    source_low: "rtsp://user:pass@ip:554/stream_low"  # optional second path
+    # Codec per stream (avoids rebuild delay on first connect):
+    codec: h265           # main stream codec (auto | h264 | h265)
+    codec_low: h264       # low stream codec (defaults to codec if unset)
+    # Resolution hints for fallback frames (before camera first connects):
+    width: 1920           # main stream width
+    height: 1080          # main stream height
+    width_low: 640        # low stream width
+    height_low: 480       # low stream height
+    # Per-camera overrides (all optional — inherits from defaults):
     battery_mode: true
-    retry_interval: 3s
-    timeout: 10s
+    retry_interval: 1s
+    timeout: 5s
     fallback_fps: 5
-    fallback_mode: offline  # override per camera
-    codec: auto
+    fallback_mode: offline
 ```
+
+### Codec configuration
+
+For **Dahua battery cameras** (H.265 main + H.264 sub), set explicit codecs:
+
+```yaml
+codec: h265       # main stream = H.265
+codec_low: h264   # sub stream = H.264
+```
+
+This eliminates a stream rebuild on the first camera connection. With `codec: auto`, the proxy starts in H.264 mode and must rebuild the entire RTSP session when it discovers H.265 — go2rtc/Frigate must reconnect, adding ~2s delay.
 
 **Environment variable expansion**: use `${VAR}` in config values. Credentials can be passed via environment variables in `docker-compose.yml`.
 

@@ -16,9 +16,9 @@ services:
     environment:
       - TZ=Europe/Paris
       # Camera credentials (referenced in config.yaml via ${VAR})
-      - CAM_USER=admin
-      - CAM_PASS_JARDIN=L202EA64
-      - CAM_PASS_ENTREE=L2DEB678
+      - CAM_USER=${CAM_USER:-admin}
+      - CAM_PASS_JARDIN=${CAM_PASS_JARDIN}
+      - CAM_PASS_ENTREE=${CAM_PASS_ENTREE}
     networks:
       - surveillance
 
