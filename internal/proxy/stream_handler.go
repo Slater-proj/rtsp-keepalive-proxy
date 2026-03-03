@@ -348,17 +348,24 @@ func (sh *StreamHandler) SetRebuildCallback(cb func(*description.Session) *gorts
 // re-encodes fallback frames with the new codec, rebuilds the description
 // and server stream, then restarts fallback.
 func (sh *StreamHandler) rebuildForCodec(ctx context.Context, newCodec string) {
+	sh.mu.RLock()
+	oldCodec := sh.detectedCodec
+	sh.mu.RUnlock()
 	sh.log.Info("codec change detected, rebuilding stream",
-		"old_codec", sh.detectedCodec, "new_codec", newCodec)
+		"old_codec", oldCodec, "new_codec", newCodec)
 
 	// Stop current output producers.
 	sh.stopFallback()
 	sh.stopSilenceAudio()
 
-	// Update codec.
+	// Update codec and clear stale camera keyframe (wrong codec).
 	sh.mu.Lock()
 	sh.detectedCodec = newCodec
 	sh.mu.Unlock()
+
+	sh.lastCameraVideoAUMu.Lock()
+	sh.lastCameraVideoAU = nil
+	sh.lastCameraVideoAUMu.Unlock()
 
 	// Re-encode fallback frames with the new codec (sets initialSPS/PPS).
 	sh.preEncodeFallback()
@@ -1028,12 +1035,12 @@ func (sh *StreamHandler) writeToStream(pkt *rtp.Packet) {
 	}
 
 	outTS := sh.videoOutBase + (pkt.Timestamp - sh.videoSrcBase)
-	// Track the HIGH-WATER MARK, not just the last value.  With H.265
-	// B-frames the decode order is I, P, B, B … so PTS can be non-
-	// monotonic.  If we store a B-frame PTS as lastOut and then splice
-	// to a new source, outBase would land BEFORE the earlier P-frame,
-	// creating a backwards timestamp jump that corrupts MP4 recordings.
-	if outTS > sh.videoLastOut {
+	// Track the HIGH-WATER MARK using signed-difference comparison to
+	// handle uint32 wrapping (RTP timestamps wrap every ~13 h at 90 kHz).
+	// With H.265 B-frames the decode order is I, P, B, B … so PTS can be
+	// non-monotonic.  Using max() prevents backwards timestamp jumps on
+	// source splice that would corrupt MP4 recordings.
+	if int32(outTS-sh.videoLastOut) > 0 {
 		sh.videoLastOut = outTS
 	}
 	pkt.Timestamp = outTS
@@ -1091,7 +1098,7 @@ func (sh *StreamHandler) writeAudioToStream(pkt *rtp.Packet) {
 	}
 
 	outTS := sh.audioOutBase + (pkt.Timestamp - sh.audioSrcBase)
-	if outTS > sh.audioLastOut {
+	if int32(outTS-sh.audioLastOut) > 0 {
 		sh.audioLastOut = outTS
 	}
 	pkt.Timestamp = outTS
@@ -1124,12 +1131,11 @@ func (sh *StreamHandler) startSilenceAudio(ctx context.Context) {
 
 func (sh *StreamHandler) stopSilenceAudio() {
 	sh.silenceMu.Lock()
-	defer sh.silenceMu.Unlock()
-
 	if sh.silenceCancel != nil {
 		sh.silenceCancel()
 		sh.silenceCancel = nil
 	}
+	sh.silenceMu.Unlock()
 	sh.silenceWg.Wait()
 }
 
@@ -1221,12 +1227,19 @@ func (sh *StreamHandler) captureKeyframeH264(au [][]byte) {
 
 		// Only probe dimensions when SPS actually changes.
 		if spsChanged {
-			sh.updateDimensionsFromSPS(sps)
+			spsCP := copyBytes(sps)
+			go sh.updateDimensionsFromSPS(spsCP)
 		}
 	}
 
 	if hasIDR {
-		sh.decodeAndStore(au, "h264")
+		// Run FFmpeg keyframe capture in a background goroutine so
+		// it never blocks the RTP callback (decode takes 100ms+).
+		auCopy := make([][]byte, len(au))
+		for i, n := range au {
+			auCopy[i] = copyBytes(n)
+		}
+		go sh.decodeAndStore(auCopy, "h264")
 	}
 }
 
@@ -1237,7 +1250,13 @@ func (sh *StreamHandler) captureKeyframeH265(au [][]byte) {
 		}
 		naluType := (nalu[0] >> 1) & 0x3F
 		if naluType == 19 || naluType == 20 {
-			sh.decodeAndStore(au, "h265")
+			// Run FFmpeg keyframe capture in a background goroutine so
+			// it never blocks the RTP callback (decode takes 100ms+).
+			auCopy := make([][]byte, len(au))
+			for i, n := range au {
+				auCopy[i] = copyBytes(n)
+			}
+			go sh.decodeAndStore(auCopy, "h265")
 			return
 		}
 	}
@@ -1306,6 +1325,11 @@ func (sh *StreamHandler) decodeAndStore(nalus [][]byte, codec string) {
 		"-f", "image2pipe", "-vcodec", "png",
 		"pipe:1",
 	)
+
+	// Timeout to prevent hanging FFmpeg processes.
+	decCtx, decCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer decCancel()
+	cmd = exec.CommandContext(decCtx, cmd.Path, cmd.Args[1:]...)
 	cmd.Stdin = &buf
 
 	var stdout, stderr bytes.Buffer
@@ -1750,7 +1774,10 @@ func hasH265VCL(au [][]byte) bool {
 	return false
 }
 
-// filterH265NALUs removes empty NALUs and filters invalid types.
+// filterH265NALUs removes empty NALUs and applies a whitelist of known-safe
+// H.265 NALU types. Only VCL (0-31), VPS (32), SPS (33), PPS (34), and
+// prefix/suffix SEI (39, 40) are kept. AUD, filler, end-of-seq, etc. are
+// dropped to prevent confusing downstream demuxers.
 func filterH265NALUs(au [][]byte) [][]byte {
 	var filtered [][]byte
 	for _, nalu := range au {
@@ -1758,10 +1785,17 @@ func filterH265NALUs(au [][]byte) [][]byte {
 			continue
 		}
 		nt := (nalu[0] >> 1) & 0x3F
-		if nt > 47 {
-			continue // Reserved / unspecified
+		switch {
+		case nt <= 31: // VCL
+			filtered = append(filtered, nalu)
+		case nt == 32, nt == 33, nt == 34: // VPS, SPS, PPS
+			filtered = append(filtered, nalu)
+		case nt == 39, nt == 40: // Prefix/Suffix SEI
+			filtered = append(filtered, nalu)
+		default:
+			// Drop AUD (35), EOS (36), EOB (37), filler (38), and
+			// reserved/unspecified types that can confuse muxers.
 		}
-		filtered = append(filtered, nalu)
 	}
 	return filtered
 }
