@@ -439,18 +439,19 @@ func (sh *StreamHandler) rebuildForCodec(ctx context.Context, newCodec string, s
 	// for the camera to begin sending audio packets.
 	sh.startSilenceAudio(ctx)
 
-	if !cameraParamsSet {
-		// Camera didn't provide VPS/SPS/PPS in DESCRIBE — we can't
-		// guarantee parameter consistency, so start fallback with the
-		// encoder's own parameters (they at least match the SDP).
-		sh.log.Warn("camera DESCRIBE missing codec params, starting fallback")
-		sh.startFallback(ctx)
+	// ALWAYS start fallback after rebuild. Without this, there's a dead
+	// gap (zero video) between rebuild and the camera's first IRAP:
+	// go2rtc must reconnect after stream rebuild, then wait for an IRAP
+	// — easily 2-5s of no video, causing FFmpeg to fail.
+	//
+	// The fallback loop normalises every frame's VPS/SPS/PPS to match
+	// initialVPS/SPS/PPS (which are set from the camera when available),
+	// so fallback data is always consistent with the SDP.
+	sh.startFallback(ctx)
+
+	if newCodec == "h265" && cameraParamsSet {
+		sh.log.Info("TIP: set 'codec: h265' in config to avoid rebuild delay on first connection")
 	}
-	// When cameraParamsSet is true, do NOT start video fallback here.
-	// The caller (connectAndRelay) is about to relay the camera's actual
-	// video stream. Starting fallback would send pre-encoded frames whose
-	// VPS/SPS/PPS (from libx265) differ from the SDP (from camera),
-	// corrupting MP4 recording segments.
 }
 
 // Start begins the connection/relay/fallback loop.
@@ -548,7 +549,13 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 	//
 	// ReadTimeout stays generous (30s) for active streaming — the
 	// application-level packet ticker handles faster sleep detection.
+	// Battery cameras: 3s max dial — they wake for only 10-25s and we
+	// can't afford to waste 5s on a failed TCP SYN.  Non-battery cameras
+	// keep the default 5s.
 	dialTimeout := 5 * time.Second
+	if sh.cfg.BatteryMode {
+		dialTimeout = 3 * time.Second
+	}
 	if sh.cfg.Timeout > 0 && sh.cfg.Timeout < dialTimeout {
 		dialTimeout = sh.cfg.Timeout
 	}
@@ -1634,9 +1641,21 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 	}
 	tickCount := 0
 
+	// Read current parameter sets for normalization (may be from camera
+	// or from libx265/libx264 if camera hasn't connected yet — in that
+	// case they still match the SDP, so consistency is maintained).
+	sh.mu.RLock()
+	fbVPS := copyBytes(sh.initialVPS)
+	fbSPS := copyBytes(sh.initialSPS)
+	fbPPS := copyBytes(sh.initialPPS)
+	sh.mu.RUnlock()
+
 	sh.log.Info("fallback stream started",
 		"codec", codec, "fps", fps,
-		"variants", len(frameVariants))
+		"variants", len(frameVariants),
+		"has_vps", fbVPS != nil,
+		"has_sps", fbSPS != nil,
+		"has_pps", fbPPS != nil)
 
 	ticker := time.NewTicker(time.Second / time.Duration(fps))
 	defer ticker.Stop()
@@ -1650,6 +1669,17 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		}
 
 		au := frameVariants[variantIdx]
+
+		// Normalise VPS/SPS/PPS in the fallback AU to match the SDP.
+		// Pre-encoded frames may contain libx265/libx264 parameter sets
+		// that differ from the camera's (stored in initialVPS/SPS/PPS).
+		// Without this, the HEVCDecoderConfigurationRecord in MP4 segments
+		// doesn't match the actual NALUs → "No new valid recording segments".
+		if codec == "h265" && fbVPS != nil {
+			au = ensureVPSSPSPPS(au, fbVPS, fbSPS, fbPPS)
+		} else if codec == "h264" && fbSPS != nil {
+			au = ensureSPSPPS(au, fbSPS, fbPPS)
+		}
 
 		if codec == "h265" && h265Enc != nil {
 			pkts, err := h265Enc.Encode(au)
