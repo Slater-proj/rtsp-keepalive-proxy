@@ -9,6 +9,7 @@ import (
 	"image/draw"
 	"image/png"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"runtime/debug"
@@ -540,13 +541,25 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 		return fmt.Errorf("parse url: %w", err)
 	}
 
-	// TCP-level timeouts must be generous -- the camera can pause for
-	// long stretches (battery sleep, I-frame generation, etc.).  Our
-	// application-level packet ticker (Timeout/2) handles the faster
-	// fallback-transition logic independently.
+	// TCP dial timeout must be SHORT so we don't block 30s on a sleeping
+	// camera. Without this, each connection attempt to a powered-off
+	// battery camera blocks for ReadTimeout (30s), meaning the proxy
+	// misses entire camera wake windows (10-25s).
+	//
+	// ReadTimeout stays generous (30s) for active streaming — the
+	// application-level packet ticker handles faster sleep detection.
+	dialTimeout := 5 * time.Second
+	if sh.cfg.Timeout > 0 && sh.cfg.Timeout < dialTimeout {
+		dialTimeout = sh.cfg.Timeout
+	}
+
 	c := &gortsplib.Client{
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 10 * time.Second,
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: dialTimeout}
+			return d.DialContext(ctx, network, address)
+		},
 	}
 
 	if err := c.Start(u.Scheme, u.Host); err != nil {
@@ -674,8 +687,13 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 	sh.lastOnline.Store(time.Now().Unix())
 	sh.log.Info("camera online, relaying")
 
-	// Monitor connection.
-	ticker := time.NewTicker(sh.cfg.Timeout / 2)
+	// Monitor connection with fast tick (1s) so timeout detection
+	// is tight: worst case = Timeout + 1s instead of Timeout + Timeout/2.
+	tickInterval := 1 * time.Second
+	if sh.cfg.Timeout < 2*time.Second {
+		tickInterval = sh.cfg.Timeout / 2
+	}
+	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 
 	for {
@@ -687,7 +705,16 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 			elapsed := time.Since(lastPktTime)
 			lastPktTimeMu.Unlock()
 
-			if elapsed > sh.cfg.Timeout {
+			if elapsed >= sh.cfg.Timeout {
+				// Start fallback IMMEDIATELY before returning, so
+				// consumers never see a dead gap. Previously fallback
+				// only started after returning to loop(), adding up
+				// to tick-interval + loop overhead of zero video output
+				// that caused go2rtc/Frigate to lose the stream.
+				if sh.cfg.BatteryMode && sh.cfg.FallbackMode != "none" {
+					sh.state.Store(int32(StateSleeping))
+					sh.startFallback(ctx)
+				}
 				return fmt.Errorf("timeout: no packet for %s", elapsed.Round(time.Millisecond))
 			}
 		}
@@ -758,6 +785,8 @@ func (sh *StreamHandler) registerCallback(
 		camPPS := copyBytes(h264f.PPS)
 		seenIDR := false
 		silenceStopped := false
+		firstAU := true
+		connectTime := time.Now()
 
 		c.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
 			defer func() {
@@ -785,6 +814,12 @@ func (sh *StreamHandler) registerCallback(
 			au, err := dec.Decode(pkt)
 			if err != nil || au == nil {
 				return
+			}
+
+			if firstAU {
+				sh.log.Info("first video AU from camera",
+					"delay_ms", time.Since(connectTime).Milliseconds())
+				firstAU = false
 			}
 
 			// Filter out invalid / unsupported NAL types and ensure
@@ -818,7 +853,8 @@ func (sh *StreamHandler) registerCallback(
 				sh.stopFallback()
 				sh.resetVideoTimeline()
 				seenIDR = true
-				sh.log.Info("first IDR received, seamless transition to camera")
+				sh.log.Info("first IDR received, seamless transition to camera",
+					"delay_ms", time.Since(connectTime).Milliseconds())
 			}
 
 			// Track in-band SPS/PPS updates from the camera.
@@ -878,6 +914,8 @@ func (sh *StreamHandler) registerCallback(
 		camPPS := copyBytes(h265f.PPS)
 		seenIRAP := false
 		silenceStopped := false
+		firstAU265 := true
+		connectTime265 := time.Now()
 
 		c.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
 			defer func() {
@@ -907,6 +945,12 @@ func (sh *StreamHandler) registerCallback(
 				return
 			}
 
+			if firstAU265 {
+				sh.log.Info("first video AU from camera",
+					"delay_ms", time.Since(connectTime265).Milliseconds())
+				firstAU265 = false
+			}
+
 			au = filterH265NALUs(au)
 			if len(au) == 0 {
 				return
@@ -932,7 +976,8 @@ func (sh *StreamHandler) registerCallback(
 				sh.stopFallback()
 				sh.resetVideoTimeline()
 				seenIRAP = true
-				sh.log.Info("first IRAP received, seamless transition to camera")
+				sh.log.Info("first IRAP received, seamless transition to camera",
+					"delay_ms", time.Since(connectTime265).Milliseconds())
 			}
 
 			// Track in-band VPS/SPS/PPS.
