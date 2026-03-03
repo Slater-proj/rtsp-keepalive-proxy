@@ -32,6 +32,11 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 			lowResolved := resolved
 			lowResolved.Source = resolved.SourceLow
 
+			// Apply codec_low override if configured.
+			if camCfg.CodecLow != nil {
+				lowResolved.Codec = *camCfg.CodecLow
+			}
+
 			// Use low stream dimensions if configured, otherwise use
 			// a sensible default for sub-streams (typically 640x480).
 			if camCfg.WidthLow != nil {

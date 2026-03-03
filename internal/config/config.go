@@ -55,6 +55,7 @@ type CameraConfig struct {
 	FallbackFPS   *int           `yaml:"fallback_fps,omitempty"`
 	FallbackMode  *string        `yaml:"fallback_mode,omitempty"` // "offline", "last_frame", "none"
 	Codec         *string        `yaml:"codec,omitempty"`
+	CodecLow      *string        `yaml:"codec_low,omitempty"` // codec for source_low (defaults to codec)
 }
 
 // Effective returns a resolved copy where nil fields are filled from defaults.
