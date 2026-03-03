@@ -197,18 +197,23 @@ func (sh *StreamHandler) preEncodeFallback() {
 		return
 	}
 
-	// Store parameter sets for the SDP.
+	// Store parameter sets for the SDP, but ONLY if they haven't
+	// already been set from the camera's DESCRIBE response. Camera
+	// params take priority because they match the actual video stream.
+	// Fallback encoder params (libx265/libx264) differ from the
+	// camera's and would cause HEVCDecoderConfigurationRecord mismatch
+	// in MP4 recording segments.
 	if codec == "h265" {
-		if vps != nil {
+		if sh.initialVPS == nil && vps != nil {
 			sh.initialVPS = copyBytes(vps)
 		}
-		if sps != nil {
+		if sh.initialSPS == nil && sps != nil {
 			sh.initialSPS = copyBytes(sps)
 		}
-		if pps != nil {
+		if sh.initialPPS == nil && pps != nil {
 			sh.initialPPS = copyBytes(pps)
 		}
-	} else if sps != nil && pps != nil {
+	} else if sh.initialSPS == nil && sps != nil && pps != nil {
 		sh.initialSPS = copyBytes(sps)
 		sh.initialPPS = copyBytes(pps)
 	}
@@ -346,8 +351,15 @@ func (sh *StreamHandler) SetRebuildCallback(cb func(*description.Session) *gorts
 
 // rebuildForCodec handles a runtime codec change: stops current output,
 // re-encodes fallback frames with the new codec, rebuilds the description
-// and server stream, then restarts fallback.
-func (sh *StreamHandler) rebuildForCodec(ctx context.Context, newCodec string) {
+// and server stream.
+//
+// srcDesc is the camera's DESCRIBE response. When non-nil, the camera's
+// actual VPS/SPS/PPS are extracted and used for the SDP so downstream
+// consumers (go2rtc → Frigate FFmpeg) get the real codec parameters.
+// Without this, the SDP would contain libx265 encoder parameters that
+// differ from the camera's, producing an HEVCDecoderConfigurationRecord
+// mismatch in MP4 segments → "No new valid recording segments" errors.
+func (sh *StreamHandler) rebuildForCodec(ctx context.Context, newCodec string, srcDesc *description.Session) {
 	sh.mu.RLock()
 	oldCodec := sh.detectedCodec
 	sh.mu.RUnlock()
@@ -367,7 +379,44 @@ func (sh *StreamHandler) rebuildForCodec(ctx context.Context, newCodec string) {
 	sh.lastCameraVideoAU = nil
 	sh.lastCameraVideoAUMu.Unlock()
 
-	// Re-encode fallback frames with the new codec (sets initialSPS/PPS).
+	// Extract the camera's actual VPS/SPS/PPS from the DESCRIBE response
+	// BEFORE pre-encoding fallback. preEncodeFallback will skip overwriting
+	// these fields when they are already set, so the SDP always advertises
+	// the camera's real parameters instead of the fallback encoder's.
+	cameraParamsSet := false
+	if srcDesc != nil {
+		if newCodec == "h265" {
+			var srcFmt *format.H265
+			if srcDesc.FindFormat(&srcFmt) != nil && srcFmt != nil {
+				if srcFmt.VPS != nil && srcFmt.SPS != nil && srcFmt.PPS != nil {
+					sh.initialVPS = copyBytes(srcFmt.VPS)
+					sh.initialSPS = copyBytes(srcFmt.SPS)
+					sh.initialPPS = copyBytes(srcFmt.PPS)
+					cameraParamsSet = true
+					sh.log.Info("using camera VPS/SPS/PPS for SDP",
+						"vps_len", len(srcFmt.VPS),
+						"sps_len", len(srcFmt.SPS),
+						"pps_len", len(srcFmt.PPS))
+				}
+			}
+		} else {
+			var srcFmt *format.H264
+			if srcDesc.FindFormat(&srcFmt) != nil && srcFmt != nil {
+				if srcFmt.SPS != nil && srcFmt.PPS != nil {
+					sh.initialSPS = copyBytes(srcFmt.SPS)
+					sh.initialPPS = copyBytes(srcFmt.PPS)
+					cameraParamsSet = true
+					sh.log.Info("using camera SPS/PPS for SDP",
+						"sps_len", len(srcFmt.SPS),
+						"pps_len", len(srcFmt.PPS))
+				}
+			}
+		}
+	}
+
+	// Re-encode fallback frames with the new codec.
+	// preEncodeFallback will NOT overwrite initialVPS/SPS/PPS when they
+	// are already set from the camera (see above).
 	sh.preEncodeFallback()
 
 	// Rebuild SDP and server stream.
@@ -385,8 +434,22 @@ func (sh *StreamHandler) rebuildForCodec(ctx context.Context, newCodec string) {
 		sh.mu.Unlock()
 	}
 
-	// Restart fallback (with new codec) so consumers have data immediately.
-	sh.startFallback(ctx)
+	// Start silence audio so the audio track has data while we wait
+	// for the camera to begin sending audio packets.
+	sh.startSilenceAudio(ctx)
+
+	if !cameraParamsSet {
+		// Camera didn't provide VPS/SPS/PPS in DESCRIBE — we can't
+		// guarantee parameter consistency, so start fallback with the
+		// encoder's own parameters (they at least match the SDP).
+		sh.log.Warn("camera DESCRIBE missing codec params, starting fallback")
+		sh.startFallback(ctx)
+	}
+	// When cameraParamsSet is true, do NOT start video fallback here.
+	// The caller (connectAndRelay) is about to relay the camera's actual
+	// video stream. Starting fallback would send pre-encoded frames whose
+	// VPS/SPS/PPS (from libx265) differ from the SDP (from camera),
+	// corrupting MP4 recording segments.
 }
 
 // Start begins the connection/relay/fallback loop.
@@ -513,7 +576,7 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 	currentCodec := sh.detectedCodec
 	sh.mu.RUnlock()
 	if codec != currentCodec {
-		sh.rebuildForCodec(ctx, codec)
+		sh.rebuildForCodec(ctx, codec, srcDesc)
 	}
 
 	sh.mu.Lock()
@@ -522,6 +585,9 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 	// Copy source SPS/PPS to the output format so the SDP advertises
 	// the camera's actual sprop-parameter-sets. Also extract dimensions
 	// to update the fallback generator.
+	// Additionally persist camera params in initialVPS/SPS/PPS so that
+	// BuildDescription (called on future rebuilds or new client DESCRIBE)
+	// always uses the camera's real parameters.
 	if codec == "h264" {
 		var srcFmt *format.H264
 		if srcDesc.FindFormat(&srcFmt) != nil && srcFmt != nil {
@@ -530,6 +596,10 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 					outFmt.SPS = srcFmt.SPS
 					outFmt.PPS = srcFmt.PPS
 				}
+			}
+			if srcFmt.SPS != nil {
+				sh.initialSPS = copyBytes(srcFmt.SPS)
+				sh.initialPPS = copyBytes(srcFmt.PPS)
 			}
 			// Extract resolution from SPS for fallback generator.
 			sh.updateDimensionsFromSPS(srcFmt.SPS)
@@ -543,6 +613,11 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 					outFmt.SPS = srcFmt.SPS
 					outFmt.PPS = srcFmt.PPS
 				}
+			}
+			if srcFmt.VPS != nil {
+				sh.initialVPS = copyBytes(srcFmt.VPS)
+				sh.initialSPS = copyBytes(srcFmt.SPS)
+				sh.initialPPS = copyBytes(srcFmt.PPS)
 			}
 		}
 	}
