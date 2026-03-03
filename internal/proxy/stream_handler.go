@@ -97,6 +97,13 @@ type StreamHandler struct {
 	preBaseAU [][]byte // base fallback frame (Access Unit)
 	preDotAU  [][]byte // dot-indicator variant
 
+	// Last camera IRAP/IDR Access Unit (raw NALUs including VPS/SPS/PPS).
+	// Used by fallback to replay the camera's actual keyframe, ensuring
+	// VPS/SPS/PPS consistency with the camera's bitstream so that MP4
+	// HEVCDecoderConfigurationRecord always matches the stream data.
+	lastCameraVideoAU   [][]byte
+	lastCameraVideoAUMu sync.RWMutex
+
 	// Callback to rebuild the server stream when the detected codec changes
 	// at runtime (e.g. camera SDP reveals H.265 but initial SDP was H.264).
 	rebuildCb func(*description.Session) *gortsplib.ServerStream
@@ -463,9 +470,13 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 		return fmt.Errorf("parse url: %w", err)
 	}
 
+	// TCP-level timeouts must be generous -- the camera can pause for
+	// long stretches (battery sleep, I-frame generation, etc.).  Our
+	// application-level packet ticker (Timeout/2) handles the faster
+	// fallback-transition logic independently.
 	c := &gortsplib.Client{
-		ReadTimeout:  sh.cfg.Timeout,
-		WriteTimeout: sh.cfg.Timeout,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 10 * time.Second,
 	}
 
 	if err := c.Start(u.Scheme, u.Host); err != nil {
@@ -747,6 +758,9 @@ func (sh *StreamHandler) registerCallback(
 			// in-band parameter sets rather than SDP sprop.
 			au = ensureSPSPPS(au, camSPS, camPPS)
 
+			// Store IDR AUs for fallback replay (avoids SPS/PPS mismatch).
+			sh.storeLastCameraKeyframe(au, "h264")
+
 			sh.captureKeyframeH264(au)
 
 			outPkts, err := enc.Encode(au)
@@ -856,6 +870,9 @@ func (sh *StreamHandler) registerCallback(
 			}
 
 			au = ensureVPSSPSPPS(au, camVPS, camSPS, camPPS)
+
+			// Store IRAP AUs for fallback replay (avoids VPS/SPS/PPS mismatch).
+			sh.storeLastCameraKeyframe(au, "h265")
 
 			sh.captureKeyframeH265(au)
 
@@ -1011,7 +1028,14 @@ func (sh *StreamHandler) writeToStream(pkt *rtp.Packet) {
 	}
 
 	outTS := sh.videoOutBase + (pkt.Timestamp - sh.videoSrcBase)
-	sh.videoLastOut = outTS
+	// Track the HIGH-WATER MARK, not just the last value.  With H.265
+	// B-frames the decode order is I, P, B, B … so PTS can be non-
+	// monotonic.  If we store a B-frame PTS as lastOut and then splice
+	// to a new source, outBase would land BEFORE the earlier P-frame,
+	// creating a backwards timestamp jump that corrupts MP4 recordings.
+	if outTS > sh.videoLastOut {
+		sh.videoLastOut = outTS
+	}
 	pkt.Timestamp = outTS
 
 	// -- Write --
@@ -1067,7 +1091,9 @@ func (sh *StreamHandler) writeAudioToStream(pkt *rtp.Packet) {
 	}
 
 	outTS := sh.audioOutBase + (pkt.Timestamp - sh.audioSrcBase)
-	sh.audioLastOut = outTS
+	if outTS > sh.audioLastOut {
+		sh.audioLastOut = outTS
+	}
 	pkt.Timestamp = outTS
 
 	if err := stream.WritePacketRTP(desc.Medias[1], pkt); err != nil {
@@ -1217,6 +1243,44 @@ func (sh *StreamHandler) captureKeyframeH265(au [][]byte) {
 	}
 }
 
+// storeLastCameraKeyframe saves a deep copy of an IRAP (H.265) or IDR (H.264)
+// access unit from the camera. When fallback engages, it replays this frame
+// instead of the libx265/libx264-encoded placeholder, guaranteeing that the
+// output VPS/SPS/PPS (or SPS/PPS) are always consistent with the camera's
+// actual bitstream. Without this, the HEVCDecoderConfigurationRecord written
+// into MP4 segment headers during fallback doesn't match the camera data
+// that follows, making recordings unplayable.
+func (sh *StreamHandler) storeLastCameraKeyframe(au [][]byte, codec string) {
+	isKeyframe := false
+	for _, nalu := range au {
+		if codec == "h265" {
+			if len(nalu) >= 2 {
+				nt := (nalu[0] >> 1) & 0x3F
+				if nt >= 16 && nt <= 21 {
+					isKeyframe = true
+					break
+				}
+			}
+		} else {
+			if len(nalu) > 0 && (nalu[0]&0x1F) == 5 {
+				isKeyframe = true
+				break
+			}
+		}
+	}
+	if !isKeyframe {
+		return
+	}
+
+	stored := make([][]byte, len(au))
+	for i, nalu := range au {
+		stored[i] = copyBytes(nalu)
+	}
+	sh.lastCameraVideoAUMu.Lock()
+	sh.lastCameraVideoAU = stored
+	sh.lastCameraVideoAUMu.Unlock()
+}
+
 func (sh *StreamHandler) decodeAndStore(nalus [][]byte, codec string) {
 	now := time.Now().Unix()
 	if last := sh.lastCaptureTS.Load(); now-last < 5 {
@@ -1334,7 +1398,18 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 	// ---------------------------------------------------------------
 	var frameVariants [][][]byte
 
-	if len(sh.preBaseAU) > 0 {
+	// Prefer the last camera keyframe for fallback replay.  This ensures
+	// VPS/SPS/PPS (H.265) or SPS/PPS (H.264) are identical to the camera's
+	// actual bitstream, so the MP4 HEVCDecoderConfigurationRecord stays
+	// consistent and recording segments are always playable.
+	sh.lastCameraVideoAUMu.RLock()
+	cameraAU := sh.lastCameraVideoAU
+	sh.lastCameraVideoAUMu.RUnlock()
+
+	if len(cameraAU) > 0 {
+		frameVariants = append(frameVariants, cameraAU)
+		sh.log.Info("fallback: using last camera keyframe")
+	} else if len(sh.preBaseAU) > 0 {
 		// Fast path: pre-encoded during init, zero latency.
 		frameVariants = append(frameVariants, sh.preBaseAU)
 		if len(sh.preDotAU) > 0 {
