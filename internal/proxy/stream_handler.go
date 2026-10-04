@@ -396,8 +396,13 @@ func (sh *StreamHandler) rebuildForCodec(ctx context.Context, newCodec string, s
 	sh.mu.RLock()
 	oldCodec := sh.detectedCodec
 	sh.mu.RUnlock()
-	sh.log.Info("codec change detected, rebuilding stream",
-		"old_codec", oldCodec, "new_codec", newCodec)
+	if oldCodec == newCodec {
+		sh.log.Info("camera parameter sets differ from the advertised SDP, rebuilding stream "+
+			"so consumers reconnect with the camera's real VPS/SPS/PPS", "codec", newCodec)
+	} else {
+		sh.log.Info("codec change detected, rebuilding stream",
+			"old_codec", oldCodec, "new_codec", newCodec)
+	}
 
 	// Stop current output producers.
 	sh.stopFallback()
@@ -447,10 +452,13 @@ func (sh *StreamHandler) rebuildForCodec(ctx context.Context, newCodec string, s
 		}
 	}
 
-	// Re-encode fallback frames with the new codec.
-	// preEncodeFallback will NOT overwrite initialVPS/SPS/PPS when they
-	// are already set from the camera (see above).
-	sh.preEncodeFallback()
+	// Re-encode fallback frames with the new codec. Only when the camera's
+	// parameter sets are NOT known: a frame encoded by libx264/libx265 can
+	// never be decoded with someone else's SPS/PPS, so when the SDP carries
+	// the camera's parameters there is no consistent generated fallback.
+	if !cameraParamsSet {
+		sh.preEncodeFallback()
+	}
 
 	// Rebuild SDP and server stream.
 	newDesc := sh.BuildDescription()
@@ -471,15 +479,15 @@ func (sh *StreamHandler) rebuildForCodec(ctx context.Context, newCodec string, s
 	// for the camera to begin sending audio packets.
 	sh.startSilenceAudio(ctx)
 
-	// ALWAYS start fallback after rebuild. Without this, there's a dead
-	// gap (zero video) between rebuild and the camera's first IRAP:
-	// go2rtc must reconnect after stream rebuild, then wait for an IRAP
-	// — easily 2-5s of no video, causing FFmpeg to fail.
-	//
-	// The fallback loop normalises every frame's VPS/SPS/PPS to match
-	// initialVPS/SPS/PPS (which are set from the camera when available),
-	// so fallback data is always consistent with the SDP.
-	sh.startFallback(ctx)
+	// Start the generated fallback only when its own parameter sets are the
+	// advertised ones. With the camera's parameters in the SDP, a generated
+	// frame would be decoded with the wrong SPS/PPS (garbage, and corrupt
+	// MP4 segments); the camera is about to stream anyway and consumers
+	// were just disconnected by the rebuild, so they reconnect on the real
+	// stream. Later fallbacks replay the camera's own keyframe.
+	if !cameraParamsSet {
+		sh.startFallback(ctx)
+	}
 
 	if newCodec == "h265" && cameraParamsSet {
 		sh.log.Info("TIP: set 'codec: h265' in config to avoid rebuild delay on first connection")
@@ -690,7 +698,12 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 	sh.mu.RLock()
 	currentCodec := sh.detectedCodec
 	sh.mu.RUnlock()
-	if codec != currentCodec {
+	// Same when the camera's VPS/SPS/PPS differ from the ones already
+	// advertised (typically the generated fallback's, after a cold start with
+	// an empty data_dir): consumers that are already connected keep the old
+	// SDP, and an MP4 recorder then writes a codec configuration that does
+	// not match the camera data (undecodable segments).
+	if codec != currentCodec || sh.cameraParamsDiffer(codec, srcDesc) {
 		sh.rebuildForCodec(ctx, codec, srcDesc)
 	}
 
@@ -2191,4 +2204,32 @@ func ensureVPSSPSPPS(au [][]byte, vps, sps, pps []byte) [][]byte {
 		result = append(result, nalu)
 	}
 	return result
+}
+
+// cameraParamsDiffer reports whether the camera announces parameter sets that
+// differ from the ones this handler already advertises to consumers. Nothing
+// advertised yet means nothing to be inconsistent with.
+func (sh *StreamHandler) cameraParamsDiffer(codec string, srcDesc *description.Session) bool {
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+
+	if codec == "h265" {
+		var f *format.H265
+		if srcDesc.FindFormat(&f) == nil || f == nil || f.VPS == nil || f.SPS == nil || f.PPS == nil {
+			return false
+		}
+		if sh.initialVPS == nil && sh.initialSPS == nil && sh.initialPPS == nil {
+			return false
+		}
+		return !bytes.Equal(sh.initialVPS, f.VPS) || !bytes.Equal(sh.initialSPS, f.SPS) || !bytes.Equal(sh.initialPPS, f.PPS)
+	}
+
+	var f *format.H264
+	if srcDesc.FindFormat(&f) == nil || f == nil || f.SPS == nil || f.PPS == nil {
+		return false
+	}
+	if sh.initialSPS == nil && sh.initialPPS == nil {
+		return false
+	}
+	return !bytes.Equal(sh.initialSPS, f.SPS) || !bytes.Equal(sh.initialPPS, f.PPS)
 }

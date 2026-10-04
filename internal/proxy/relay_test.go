@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -137,7 +138,8 @@ type outputClient struct {
 	mu        sync.Mutex
 	video     []rtp.Header
 	audioSeen int
-	audioBad  int // audio payloads that came from the (AAC) camera
+	audioBad  int    // audio payloads that came from the (AAC) camera
+	sps       []byte // SPS announced in the SDP
 	c         *gortsplib.Client
 }
 
@@ -157,6 +159,10 @@ func playOutput(t *testing.T, port int, path string) *outputClient {
 	desc, _, err := oc.c.Describe(u)
 	if err != nil {
 		t.Fatalf("describe output: %v", err)
+	}
+	var h264 *format.H264
+	if desc.FindFormat(&h264) != nil {
+		oc.sps = h264.SPS
 	}
 	if len(desc.Medias) != 2 {
 		t.Fatalf("output SDP has %d medias, want video+audio", len(desc.Medias))
@@ -324,4 +330,113 @@ func TestRelayFallbackLifecycle(t *testing.T) {
 	if oc.audioBad != 0 {
 		t.Errorf("%d audio packets carried the camera's AAC payload / wrong payload type", oc.audioBad)
 	}
+}
+
+// TestColdStartRebuildsStreamWithCameraParameters reproduces the recording
+// corruption seen on a real deployment: after a restart with an empty
+// data_dir, the SDP carries the generated fallback's SPS/PPS. A consumer that
+// connected then keeps that SDP, and an MP4 recorder (ffmpeg -c copy) writes a
+// codec configuration that does not match the camera's data. When the camera
+// shows up with different parameter sets, the stream must be rebuilt so the
+// consumer is disconnected and reconnects on the camera's real parameters.
+func TestColdStartRebuildsStreamWithCameraParameters(t *testing.T) {
+	cam := newFakeCamera(t)
+
+	cfg := config.ResolvedCamera{
+		Source:        fmt.Sprintf("rtsp://127.0.0.1:%d/cam", cam.port),
+		BatteryMode:   true,
+		RetryInterval: 200 * time.Millisecond,
+		Timeout:       20 * time.Second,
+		StallTimeout:  time.Second,
+		FallbackFPS:   10,
+		FallbackMode:  "offline",
+		Codec:         "h264",
+		Transport:     "tcp",
+		Audio:         "none",
+	}
+	sh := NewStreamHandler("cam", cfg)
+	// What a cold start advertises: the generated fallback's parameter sets.
+	genSPS := append([]byte{0x67, 0x42, 0xc0, 0x1f}, bytes.Repeat([]byte{0xAB}, 12)...)
+	genPPS := []byte{0x68, 0xce, 0x3c, 0x80}
+	sh.initialSPS, sh.initialPPS = genSPS, genPPS
+	sh.preBaseAU = [][]byte{genSPS, genPPS, append([]byte{0x65}, make([]byte, 40)...)}
+
+	// The camera must be reachable only after the first consumer connected.
+	if !sh.cameraParamsDiffer("h264", cam.desc) {
+		t.Fatal("the generated and the camera parameter sets are supposed to differ")
+	}
+
+	outPort := freePort(t)
+	srv := NewServer(outPort, map[string]*StreamHandler{"cam": sh})
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Stop)
+
+	rebuilds := 0
+	var mu sync.Mutex
+	orig := sh.rebuildCb
+	sh.rebuildCb = func(d *description.Session) *gortsplib.ServerStream {
+		mu.Lock()
+		rebuilds++
+		mu.Unlock()
+		return orig(d)
+	}
+
+	// Consumer connects BEFORE the camera ever woke up (Frigate's ffmpeg).
+	oc := playOutput(t, outPort, "cam")
+	before := oc.describedSPS(t)
+	if !bytes.Equal(before, genSPS) {
+		t.Fatalf("setup: consumer should see the generated SPS first, got %x", before)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sh.Start(ctx)
+	t.Cleanup(sh.Stop)
+
+	waitFor(t, 5*time.Second, "stream rebuilt for the camera's parameters", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return rebuilds == 1
+	})
+
+	// The old consumer is cut so that it reconnects.
+	closed := make(chan error, 1)
+	go func() { closed <- oc.c.Wait() }()
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the connected consumer was not disconnected by the rebuild")
+	}
+
+	// A new consumer gets the camera's real SPS/PPS.
+	oc2 := playOutput(t, outPort, "cam")
+	if got := oc2.describedSPS(t); !bytes.Equal(got, sps264CIF) {
+		t.Errorf("new consumer SPS = %x, want the camera's %x", got, sps264CIF)
+	}
+	if sh.cameraParamsDiffer("h264", cam.desc) {
+		t.Error("advertised and camera parameter sets must now match")
+	}
+
+	// And the camera relay works end to end on the rebuilt stream.
+	waitFor(t, 5*time.Second, "camera online", func() bool { return sh.GetState() == StateOnline })
+	cam.sendFrame(t, true)
+	for i := 0; i < 5; i++ {
+		cam.sendFrame(t, false)
+		time.Sleep(50 * time.Millisecond)
+	}
+	waitFor(t, 3*time.Second, "video reaches the new consumer", func() bool { return oc2.videoCount() > 0 })
+
+	mu.Lock()
+	defer mu.Unlock()
+	if rebuilds != 1 {
+		t.Errorf("stream rebuilt %d times, want exactly once", rebuilds)
+	}
+}
+
+// describedSPS returns the SPS the consumer was given in the SDP.
+func (oc *outputClient) describedSPS(t *testing.T) []byte {
+	t.Helper()
+	return oc.sps
 }
