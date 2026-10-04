@@ -1,9 +1,13 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"net"
 	"strings"
+	"time"
+
+	"github.com/bluenviron/gortsplib/v4/pkg/base"
 )
 
 // fallbackBudgetBytesPerSec bounds the bandwidth of the replayed fallback
@@ -47,4 +51,23 @@ func isUnreachable(err error) bool {
 		return true
 	}
 	return strings.Contains(err.Error(), "dial tcp")
+}
+
+// probeTCP opens and immediately closes a TCP connection to the camera's RTSP
+// port. It returns a dial error when the camera is asleep or unreachable.
+func probeTCP(ctx context.Context, u *base.URL, timeout time.Duration) error {
+	host := u.Host
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		port := "554"
+		if u.Scheme == "rtsps" {
+			port = "322"
+		}
+		host = net.JoinHostPort(u.Hostname(), port)
+	}
+	d := net.Dialer{Timeout: timeout}
+	conn, err := d.DialContext(ctx, "tcp", host)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
 }

@@ -610,6 +610,15 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 		dialTimeout = sh.cfg.DialTimeout
 	}
 
+	// gortsplib dials lazily (at the first request), so probe the TCP port
+	// ourselves first. A sleeping camera is then rejected here, cheaply and
+	// BEFORE the per-camera handshake gate is taken (otherwise two streams of
+	// one sleeping camera would queue behind each other's dial timeout).
+	if err := probeTCP(ctx, u, dialTimeout); err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	sh.unreachableLogged = false // reachable again: the next sleep is logged once more
+
 	c := &gortsplib.Client{
 		// A half-awake camera can accept the TCP connection and never answer
 		// the RTSP request. 30 s of waiting would also hold the per-camera
@@ -643,7 +652,6 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 		return fmt.Errorf("connect: %w", err)
 	}
 	defer c.Close()
-	sh.unreachableLogged = false
 
 	// Battery cameras choke when the main and the sub stream run their RTSP
 	// handshake at the same instant (resets, refused, request timed out).

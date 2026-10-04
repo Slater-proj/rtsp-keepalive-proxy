@@ -2,11 +2,13 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"rtsp-keepalive-proxy/internal/config"
 	"rtsp-keepalive-proxy/internal/fallback"
@@ -235,4 +237,37 @@ func TestIsUnreachable(t *testing.T) {
 	if isUnreachable(errors.New("timeout: no packet for 10s")) {
 		t.Error("a mid-session timeout is not 'unreachable'")
 	}
+}
+
+func TestSleepingCameraIsRejectedByTheProbe(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close() // nothing listens any more: connection refused, like a sleeping camera
+
+	sh := NewStreamHandler("sleepy", config.ResolvedCamera{
+		Source:       fmt.Sprintf("rtsp://u:p@127.0.0.1:%d/s", port),
+		Codec:        "h264",
+		FallbackMode: "none",
+		Timeout:      time.Second,
+		Transport:    "tcp",
+	})
+	sh.log = discardLogger()
+
+	start := time.Now()
+	err = sh.connectAndRelay(context.Background())
+	if err == nil || !isUnreachable(err) {
+		t.Fatalf("want an 'unreachable' error, got %v", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("probe took %s", d)
+	}
+	// the gate must stay free for the sibling stream
+	g := gateFor(fmt.Sprintf("127.0.0.1:%d", port))
+	if err := g.acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	g.releaseAfter(0)
 }
