@@ -5,6 +5,9 @@ server:
   health_port: 8080
   # Log level: debug, info, warn, error
   log_level: info
+  # Keeps the last camera keyframe of each stream across restarts, so the very first
+  # fallback frames already match the real camera (resolution, SPS/PPS). Mount a volume here.
+  data_dir: /data
 
 # Default values applied to all cameras unless overridden per-camera.
 defaults:
@@ -12,8 +15,16 @@ defaults:
   battery_mode: true
   # Interval between reconnection attempts
   retry_interval: 1s
-  # Duration without packets before camera is considered asleep
+  # TCP connect timeout towards the camera (0 = automatic: 3s battery, 5s otherwise).
+  # A sleeping camera never answers, so dial_timeout + retry_interval is the period of
+  # the "is it awake yet?" probe: 1s + 1s = a check every ~2s instead of ~5s.
+  dial_timeout: 1s
+  # Duration without ANY packet before the connection is dropped
   timeout: 5s
+  # Duration without VIDEO before the fallback takes over (the connection
+  # may still be open, e.g. a camera falling asleep without closing RTSP).
+  # Must be lower than timeout to matter; ~3x the frame interval is plenty.
+  stall_timeout: 3s
   # FPS of the fallback still-image stream (min 2)
   fallback_fps: 5
   # What to show when camera sleeps:
@@ -23,6 +34,12 @@ defaults:
   fallback_mode: offline
   # Video codec: auto (detect from camera SDP), h264, h265
   codec: auto
+  # Transport used towards the cameras: tcp (recommended for WiFi cameras,
+  # no 3 s UDP probe on every wake-up), udp, or auto (UDP then TCP).
+  transport: tcp
+  # Camera audio: auto = relay G.711 (PCMA/PCMU, 8 kHz mono), anything else
+  # (AAC, Opus...) is replaced by silence; none = always silence.
+  audio: auto
 
 # Each entry creates an RTSP output path: rtsp://<proxy>:<port>/<name>
 # If source_low is set, a second path is created: rtsp://<proxy>:<port>/low_<name>

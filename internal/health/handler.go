@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"time"
 
 	"rtsp-keepalive-proxy/internal/proxy"
@@ -72,6 +73,9 @@ type CameraStatus struct {
 	State      string `json:"state"`
 	Codec      string `json:"codec"`
 	LastOnline string `json:"last_online,omitempty"`
+	// FallbackActive is true while the generated placeholder stream is what
+	// consumers receive instead of the camera.
+	FallbackActive bool `json:"fallback_active"`
 }
 
 // handleStatus returns the state of every proxied camera.
@@ -81,15 +85,20 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	for name, h := range handlers {
 		cs := CameraStatus{
-			Name:  name,
-			State: h.GetState().String(),
-			Codec: h.GetCodec(),
+			Name:           name,
+			State:          h.GetState().String(),
+			Codec:          h.GetCodec(),
+			FallbackActive: h.FallbackActive(),
 		}
 		if lo := h.LastOnline(); !lo.IsZero() {
 			cs.LastOnline = lo.Format(time.RFC3339)
 		}
 		statuses = append(statuses, cs)
 	}
+
+	// Map iteration order is random: keep the output stable for diffing,
+	// dashboards and humans.
+	sort.Slice(statuses, func(i, j int) bool { return statuses[i].Name < statuses[j].Name })
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(statuses)
