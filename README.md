@@ -195,6 +195,29 @@ ONLINE         SLEEPING (if battery_mode)
   └──────────────┘
 ```
 
+## Battery cameras: what to expect
+
+A wake-up goes through these steps; the proxy only controls the ones in **bold**.
+
+1. The camera's motion sensor fires and the camera boots and joins the WiFi (several seconds, camera side, depends on the WiFi signal).
+2. **The proxy notices the open RTSP port** (a TCP probe every `dial_timeout` + `retry_interval`, about 0.7 s with the suggested values) and opens the main and the sub stream one after the other.
+3. **The first keyframe takes over** from the fallback within ~1-2 s of the camera answering.
+4. The camera goes back to sleep on its own after a while (25-40 s was measured on an IMOU Cell 2). **The fallback takes over after `stall_timeout`** without video.
+
+Recording through the proxy: MP4 recorders write one codec configuration (VPS/SPS/PPS) per session. The proxy therefore always advertises the **camera's own** parameter sets: it keeps the last real keyframe in `data_dir` and replays it as fallback. If the camera announces different parameter sets than the advertised ones (first start with an empty `data_dir`, camera settings changed), the stream is rebuilt once so that consumers reconnect on the right SDP; look for `camera parameter sets differ` in the log. Keep `data_dir` on a persistent volume, writable by the container user.
+
+Useful log lines:
+
+| Line | Meaning |
+|------|---------|
+| `camera unreachable, assuming it is asleep` | Once per sleep; the repeated probes are logged at debug level |
+| `camera online` / `first IDR` or `first IRAP` | Wake-up detected / first keyframe relayed (`delay_ms`) |
+| `session ended online_for=… got_keyframe=…` | One line per wake-up: how long the camera stayed awake and whether it delivered a keyframe |
+| `video stalled, switching to fallback` | No video for `stall_timeout` while the connection was still open |
+| `restored last camera keyframe from disk` | Warm start: the SDP already carries the camera's real parameters |
+
+The proxy cannot make a sleeping camera wake faster. For intrusion alerts, keep the camera's own detection, siren and SD-card recording enabled: they do not depend on the network.
+
 ## API Endpoints
 
 | Endpoint  | Method | Description                          |
