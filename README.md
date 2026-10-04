@@ -28,7 +28,9 @@ Fallback behaviour is configurable per camera: **offline overlay**, **last captu
 - **Per-camera config** — override battery mode, timeouts, FPS, fallback individually
 - **Low + high quality** — `source_low` auto-creates a `low_<name>` output path
 - **Health & status API** — HTTP endpoints for monitoring
-- **Tiny footprint** — ~30 MB Docker image (Alpine + Go binary + FFmpeg)
+- **Fast takeover** — the fallback starts when the camera closes the connection, or after `stall_timeout` (3 s by default) without video, instead of waiting for the full `timeout`
+- **Safe audio** — G.711 camera audio is relayed (µ-law is converted to A-law); any other codec is replaced by silence rather than corrupting the track
+- **Small footprint** — Alpine + a static Go binary + FFmpeg, runs as a non-root user
 
 ## Quick Start
 
@@ -83,14 +85,19 @@ server:
   rtsp_port: 8554        # Output RTSP port
   health_port: 8080      # HTTP health/status port
   log_level: info         # debug | info | warn | error
+  data_dir: /data         # optional: persist the last camera keyframe across restarts
 
 defaults:
   battery_mode: true      # Enable sleep detection + fallback
-  retry_interval: 1s      # Time between reconnection attempts
-  timeout: 5s             # No-packet duration before declaring sleep
-  fallback_fps: 5         # FPS of the still-image fallback stream (min 2)
+  retry_interval: 3s      # Time between reconnection attempts (default 3s)
+  timeout: 10s            # No packet at all before the connection is dropped (default 10s)
+  dial_timeout: 0s        # TCP connect timeout, 0 = automatic (3s battery / 5s)
+  stall_timeout: 3s       # No VIDEO before the fallback takes over (default 3s)
+  fallback_fps: 5         # FPS of the still-image fallback stream (1-60, default 5)
   fallback_mode: offline  # offline | last_frame | none
   codec: auto             # auto | h264 | h265
+  transport: tcp          # tcp | udp | auto  (default tcp)
+  audio: auto             # auto (relay G.711, else silence) | none
 
 cameras:
   my_camera:
@@ -108,9 +115,28 @@ cameras:
     battery_mode: true
     retry_interval: 1s
     timeout: 5s
+    stall_timeout: 2s
     fallback_fps: 5
     fallback_mode: offline
+    transport: tcp
+    audio: auto
 ```
+
+If `defaults.battery_mode` is omitted it is `true`. The configuration is validated at start-up: unknown codecs, transports or fallback modes, out-of-range values, invalid camera names and colliding output paths (`low_x` produced by `x` + `source_low` and a camera named `low_x`) are rejected with an explicit error.
+
+### Fallback modes
+
+| Mode | What consumers receive while the camera sleeps |
+|------|-----------------------------------------------|
+| `offline` | A generated `<NAME> - OFFLINE` image **until the camera has streamed once**. After that, the camera's **last keyframe** is replayed (see below). |
+| `last_frame` | Same replay of the camera's last keyframe; additionally a PNG snapshot is kept (costs one short FFmpeg run per 5 s of live video). |
+| `none` | Nothing: consumers see a disconnect. |
+
+Why the last camera keyframe is preferred over the generated image once available: a generated frame carries its own SPS/PPS (or VPS/SPS/PPS), and MP4 recording in Frigate (`-c copy`) writes one codec configuration per segment. Mixing two encoders' parameter sets in one segment makes it unplayable.
+
+### Audio
+
+The output always carries a G.711 A-law (PCMA, 8 kHz, mono) audio track so consumers never lose it. Camera audio is relayed only when it is G.711 8 kHz mono; µ-law is converted on the fly. For AAC, Opus or other codecs the proxy logs a warning and keeps the silent track (use `audio: none` to silence the warning). Check your camera's codec with `ffprobe` if the audio sounds wrong.
 
 ### Codec configuration
 
@@ -123,7 +149,9 @@ codec_low: h264   # sub stream = H.264
 
 This eliminates a stream rebuild on the first camera connection. With `codec: auto`, the proxy starts in H.264 mode and must rebuild the entire RTSP session when it discovers H.265 — go2rtc/Frigate must reconnect, adding ~2s delay.
 
-**Environment variable expansion**: use `${VAR}` in config values. Credentials can be passed via environment variables in `docker-compose.yml`.
+**Environment variable expansion**: use `${VAR}` in config values. Credentials can be passed via environment variables in `docker-compose.yml`. Only the braced form is expanded (a `$` inside a password is left alone), and a reference to an undefined variable is a start-up error instead of a silently empty password. Credentials are masked (`rtsp://user:***@host`) in all logs.
+
+**File permissions**: the container runs as a non-root user (uid 10001 by default). Make sure `config.yaml` is readable by it, or set `user: "<uid>:<gid>"` in your compose file.
 
 ## Architecture
 
@@ -172,15 +200,15 @@ ONLINE         SLEEPING (if battery_mode)
 | Endpoint  | Method | Description                          |
 |-----------|--------|--------------------------------------|
 | `/health` | GET    | Returns `{"status": "ok"}` if alive  |
-| `/status` | GET    | JSON array of all camera states      |
+| `/status` | GET    | JSON array of all camera states, sorted by name |
 
 ### Example `/status` response
 
 ```json
 [
-  {"name": "jardin",     "state": "online",   "codec": "h264", "last_online": "2026-02-26T10:30:00Z"},
-  {"name": "low_jardin", "state": "sleeping", "codec": "h264", "last_online": "2026-02-26T10:29:55Z"},
-  {"name": "entree",     "state": "sleeping", "codec": "h265", "last_online": "2026-02-26T10:25:00Z"}
+  {"name": "entree",     "state": "sleeping", "codec": "h265", "last_online": "2026-02-26T10:25:00Z", "fallback_active": true},
+  {"name": "jardin",     "state": "online",   "codec": "h265", "last_online": "2026-02-26T10:30:00Z", "fallback_active": false},
+  {"name": "low_jardin", "state": "online",   "codec": "h264", "last_online": "2026-02-26T10:30:00Z", "fallback_active": false}
 ]
 ```
 

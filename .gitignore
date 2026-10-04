@@ -32,8 +32,6 @@ Thumbs.db
 config.yaml
 !config.yaml.example
 
-# Config with credentials (use config.yaml.example as template)
-config.yaml
 
 # Docker volumes
 data/

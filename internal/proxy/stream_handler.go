@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -23,6 +24,8 @@ import (
 	"github.com/bluenviron/gortsplib/v4/pkg/format"
 	"github.com/bluenviron/gortsplib/v4/pkg/format/rtph264"
 	"github.com/bluenviron/gortsplib/v4/pkg/format/rtph265"
+	mch264 "github.com/bluenviron/mediacommon/pkg/codecs/h264"
+	mch265 "github.com/bluenviron/mediacommon/pkg/codecs/h265"
 	"github.com/pion/rtp"
 
 	"rtsp-keepalive-proxy/internal/config"
@@ -86,6 +89,35 @@ type StreamHandler struct {
 
 	// Rate-limiting keyframe captures (unix seconds).
 	lastCaptureTS atomic.Int64
+
+	// lastVideoNano is the arrival time (unix nanoseconds) of the latest
+	// camera VIDEO packet. Unlike lastPktTime it ignores audio, so a camera
+	// that keeps sending audio/RTCP but no picture is still detected.
+	lastVideoNano atomic.Int64
+
+	// needKey is set when the fallback took over while the camera
+	// connection was still open (stall). The camera relay must then wait for
+	// a fresh keyframe before replacing the fallback again.
+	needKey atomic.Bool
+
+	// audioULaw is true when the current camera audio track is G.711 mu-law
+	// and must be converted to the A-law track advertised in our SDP.
+	audioULaw atomic.Bool
+
+	// sessionKey is true once the current camera session delivered a
+	// keyframe (reported in the "session ended" log line).
+	sessionKey atomic.Bool
+
+	// unreachableLogged limits the "camera asleep" log to one line per
+	// sleep. Only touched from the loop goroutine.
+	unreachableLogged bool
+
+	// Optional on-disk copy of the last camera keyframe (see persist.go).
+	persist *persistence
+
+	// Last SPS whose dimensions were applied to the fallback generator.
+	dimMu      sync.Mutex
+	lastDimSPS []byte
 
 	// Pre-generated parameter sets for the initial SDP.
 	initialVPS []byte // H.265 only
@@ -512,7 +544,19 @@ func (sh *StreamHandler) loop(ctx context.Context) {
 		}
 
 		if err != nil {
-			sh.log.Warn("relay ended", "error", err)
+			switch {
+			case !isUnreachable(err):
+				sh.log.Warn("relay ended", "error", sh.redactErr(err))
+			case !sh.unreachableLogged:
+				// A sleeping battery camera refuses/ignores connections
+				// every retry_interval for hours: say it once, then keep
+				// the repeats at debug level instead of flooding the log.
+				sh.unreachableLogged = true
+				sh.log.Info("camera unreachable, assuming it is asleep (further attempts logged at debug)",
+					"error", sh.redactErr(err))
+			default:
+				sh.log.Debug("camera still unreachable", "error", sh.redactErr(err))
+			}
 
 			if sh.cfg.BatteryMode && sh.cfg.FallbackMode != "none" {
 				sh.state.Store(int32(StateSleeping))
@@ -559,20 +603,63 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 	if sh.cfg.Timeout > 0 && sh.cfg.Timeout < dialTimeout {
 		dialTimeout = sh.cfg.Timeout
 	}
+	// An explicit dial_timeout wins. On a LAN a camera that is awake answers
+	// the TCP handshake in milliseconds, so 1 s is plenty and makes the wake
+	// detection loop (dial_timeout + retry_interval) much tighter.
+	if sh.cfg.DialTimeout > 0 {
+		dialTimeout = sh.cfg.DialTimeout
+	}
 
 	c := &gortsplib.Client{
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		// A half-awake camera can accept the TCP connection and never answer
+		// the RTSP request. 30 s of waiting would also hold the per-camera
+		// handshake gate (see hostgate.go) and starve the sibling stream.
+		ReadTimeout:  8 * time.Second,
+		WriteTimeout: 5 * time.Second,
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := net.Dialer{Timeout: dialTimeout}
 			return d.DialContext(ctx, network, address)
 		},
+		// gortsplib otherwise logs through the stdlib logger.
+		OnTransportSwitch: func(err error) { sh.log.Warn("rtsp transport switch", "reason", err) },
+		OnPacketLost:      func(err error) { sh.log.Debug("rtp packets lost", "reason", err) },
+		OnDecodeError:     func(err error) { sh.log.Debug("rtp decode error", "reason", err) },
+	}
+
+	// With the library default (UDP first, switch to TCP after 3 s without a
+	// packet) every wake-up of a battery camera burns 3 s of its short awake
+	// window. TCP interleaved is also what go2rtc/Frigate use, and it is
+	// immune to Docker NAT problems with UDP.
+	switch sh.cfg.Transport {
+	case "tcp":
+		t := gortsplib.TransportTCP
+		c.Transport = &t
+	case "udp":
+		t := gortsplib.TransportUDP
+		c.Transport = &t
 	}
 
 	if err := c.Start(u.Scheme, u.Host); err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
 	defer c.Close()
+	sh.unreachableLogged = false
+
+	// Battery cameras choke when the main and the sub stream run their RTSP
+	// handshake at the same instant (resets, refused, request timed out).
+	// Handshakes of one camera are serialised and spaced out.
+	gate := gateFor(u.Host)
+	if err := gate.acquire(ctx); err != nil {
+		return err
+	}
+	gateHeld := true
+	releaseGate := func() {
+		if gateHeld {
+			gateHeld = false
+			gate.releaseAfter(handshakeSpacing)
+		}
+	}
+	defer releaseGate()
 
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -622,7 +709,7 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 				sh.initialPPS = copyBytes(srcFmt.PPS)
 			}
 			// Extract resolution from SPS for fallback generator.
-			sh.updateDimensionsFromSPS(srcFmt.SPS)
+			sh.noteSPS("h264", srcFmt.SPS)
 		}
 	} else if codec == "h265" {
 		var srcFmt *format.H265
@@ -639,6 +726,7 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 				sh.initialSPS = copyBytes(srcFmt.SPS)
 				sh.initialPPS = copyBytes(srcFmt.PPS)
 			}
+			sh.noteSPS("h265", srcFmt.SPS)
 		}
 	}
 	sh.mu.Unlock()
@@ -652,7 +740,7 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 		return fmt.Errorf("setup video: %w", err)
 	}
 
-	// Also setup audio if the camera offers it.
+	// Also setup audio if the camera offers a track we can relay.
 	audioMedia := sh.findAudioMedia(srcDesc)
 	if audioMedia != nil {
 		if _, err := c.Setup(srcDesc.BaseURL, audioMedia, 0, 0); err != nil {
@@ -686,27 +774,60 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 	// Register RTP callback with decode+re-encode.
 	sh.registerCallback(c, srcDesc, audioMedia, &lastPktTime, &lastPktTimeMu)
 
+	sh.lastVideoNano.Store(time.Now().UnixNano())
+
 	if _, err := c.Play(nil); err != nil {
 		return fmt.Errorf("play: %w", err)
 	}
+	releaseGate()
 
 	sh.state.Store(int32(StateOnline))
 	sh.lastOnline.Store(time.Now().Unix())
 	sh.log.Info("camera online, relaying")
 
-	// Monitor connection with fast tick (1s) so timeout detection
-	// is tight: worst case = Timeout + 1s instead of Timeout + Timeout/2.
-	tickInterval := 1 * time.Second
-	if sh.cfg.Timeout < 2*time.Second {
-		tickInterval = sh.cfg.Timeout / 2
+	// One summary line per wake-up: how long the camera stayed awake and
+	// whether it ever delivered a keyframe. This is the number needed to
+	// tune timeouts for a battery camera.
+	playAt := time.Now()
+	sh.sessionKey.Store(false)
+	defer func() {
+		sh.log.Info("session ended",
+			"online_for", time.Since(playAt).Round(100*time.Millisecond),
+			"got_keyframe", sh.sessionKey.Load())
+	}()
+
+	// c.Wait() returns as soon as the camera closes the RTSP connection
+	// (many battery cameras do this when they go back to sleep). Without it
+	// the proxy only noticed after the packet timeout.
+	closed := make(chan error, 1)
+	go func() { closed <- c.Wait() }()
+
+	canFallback := sh.cfg.BatteryMode && sh.cfg.FallbackMode != "none"
+	enterFallback := func() {
+		if canFallback {
+			sh.state.Store(int32(StateSleeping))
+			sh.startFallback(ctx)
+		}
 	}
-	ticker := time.NewTicker(tickInterval)
+
+	// Monitor connection with a fast tick so both the stall and the timeout
+	// detection stay tight.
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+
+		case err := <-closed:
+			// Start fallback IMMEDIATELY so consumers never see a gap.
+			enterFallback()
+			if err == nil {
+				err = errors.New("closed by camera")
+			}
+			return fmt.Errorf("connection closed: %w", err)
+
 		case <-ticker.C:
 			lastPktTimeMu.Lock()
 			elapsed := time.Since(lastPktTime)
@@ -714,15 +835,23 @@ func (sh *StreamHandler) connectAndRelay(ctx context.Context) error {
 
 			if elapsed >= sh.cfg.Timeout {
 				// Start fallback IMMEDIATELY before returning, so
-				// consumers never see a dead gap. Previously fallback
-				// only started after returning to loop(), adding up
-				// to tick-interval + loop overhead of zero video output
-				// that caused go2rtc/Frigate to lose the stream.
-				if sh.cfg.BatteryMode && sh.cfg.FallbackMode != "none" {
-					sh.state.Store(int32(StateSleeping))
-					sh.startFallback(ctx)
-				}
+				// consumers never see a dead gap.
+				enterFallback()
 				return fmt.Errorf("timeout: no packet for %s", elapsed.Round(time.Millisecond))
+			}
+
+			// Stall: the connection is still open (audio or RTCP may keep
+			// flowing) but no picture has arrived for StallTimeout. Take
+			// over with the fallback long before the full Timeout, and make
+			// the relay wait for a fresh keyframe before it takes back.
+			if canFallback && !sh.fallbackRunning() {
+				sinceVideo := time.Since(time.Unix(0, sh.lastVideoNano.Load()))
+				if sinceVideo >= sh.cfg.StallTimeout {
+					sh.log.Warn("video stalled, switching to fallback",
+						"since_video", sinceVideo.Round(time.Millisecond))
+					sh.needKey.Store(true)
+					enterFallback()
+				}
 			}
 		}
 	}
@@ -740,14 +869,52 @@ func (sh *StreamHandler) findVideoMedia(desc *description.Session) (*description
 	return nil, ""
 }
 
+// findAudioMedia returns the camera audio track when it can be relayed into
+// our fixed G.711 A-law (PCMA, 8 kHz, mono) output track: A-law as is, or
+// mu-law converted on the fly. Anything else (AAC, Opus, 16 kHz...) cannot be
+// forwarded without transcoding: relaying it under a PCMA label would only
+// produce noise, so it is skipped and the silent track stays in place.
 func (sh *StreamHandler) findAudioMedia(desc *description.Session) *description.Media {
+	if sh.cfg.Audio == "none" {
+		sh.log.Info("camera audio disabled by config, using silence")
+		return nil
+	}
 	for _, m := range desc.Medias {
-		if m.Type == description.MediaTypeAudio {
-			return m
+		if m.Type != description.MediaTypeAudio {
+			continue
+		}
+		for _, f := range m.Formats {
+			if g, ok := f.(*format.G711); ok && g.SampleRate == 8000 && g.ChannelCount == 1 {
+				sh.audioULaw.Store(g.MULaw)
+				return m
+			}
+			sh.log.Warn("camera audio codec not supported, using silence instead",
+				"codec", f.Codec(),
+				"hint", "only G.711 8 kHz mono can be relayed; set 'audio: none' to silence this warning")
 		}
 	}
 	return nil
 }
+
+// relayCameraAudio forwards one camera audio packet to the output track,
+// converting mu-law to A-law when needed.
+func (sh *StreamHandler) relayCameraAudio(pkt *rtp.Packet) {
+	if sh.audioULaw.Load() {
+		pkt.Payload = ulawToAlaw(pkt.Payload)
+	}
+	sh.writeAudioToStream(pkt)
+}
+
+// fallbackRunning reports whether the fallback generator is active.
+func (sh *StreamHandler) fallbackRunning() bool {
+	sh.fallbackMu.Lock()
+	defer sh.fallbackMu.Unlock()
+	return sh.fallbackCancel != nil
+}
+
+// FallbackActive reports whether consumers currently receive the generated
+// placeholder stream instead of the camera (exposed by the status API).
+func (sh *StreamHandler) FallbackActive() bool { return sh.fallbackRunning() }
 
 // registerCallback sets up the RTP callback that DECODES camera RTP packets
 // into NAL units, then RE-ENCODES them using our own encoder. This guarantees
@@ -814,9 +981,11 @@ func (sh *StreamHandler) registerCallback(
 					silenceStopped = true
 					sh.log.Info("camera audio detected, silence stopped")
 				}
-				sh.writeAudioToStream(pkt)
+				sh.relayCameraAudio(pkt)
 				return
 			}
+
+			sh.lastVideoNano.Store(time.Now().UnixNano())
 
 			au, err := dec.Decode(pkt)
 			if err != nil || au == nil {
@@ -843,7 +1012,7 @@ func (sh *StreamHandler) registerCallback(
 			}
 
 			// Wait for the first IDR before forwarding anything.
-			if !seenIDR {
+			if !seenIDR || sh.needKey.Load() {
 				hasIDR := false
 				for _, nalu := range au {
 					if len(nalu) > 0 && (nalu[0]&0x1F) == 5 {
@@ -860,6 +1029,9 @@ func (sh *StreamHandler) registerCallback(
 				sh.stopFallback()
 				sh.resetVideoTimeline()
 				seenIDR = true
+				sh.sessionKey.Store(true)
+				sh.needKey.Store(false)
+				sh.state.Store(int32(StateOnline))
 				sh.log.Info("first IDR received, seamless transition to camera",
 					"delay_ms", time.Since(connectTime).Milliseconds())
 			}
@@ -943,9 +1115,11 @@ func (sh *StreamHandler) registerCallback(
 					silenceStopped = true
 					sh.log.Info("camera audio detected, silence stopped")
 				}
-				sh.writeAudioToStream(pkt)
+				sh.relayCameraAudio(pkt)
 				return
 			}
+
+			sh.lastVideoNano.Store(time.Now().UnixNano())
 
 			au, err := dec.Decode(pkt)
 			if err != nil || au == nil {
@@ -966,7 +1140,7 @@ func (sh *StreamHandler) registerCallback(
 				return // No picture data -- skip entirely
 			}
 
-			if !seenIRAP {
+			if !seenIRAP || sh.needKey.Load() {
 				hasIRAP := false
 				for _, nalu := range au {
 					if len(nalu) >= 2 {
@@ -983,6 +1157,9 @@ func (sh *StreamHandler) registerCallback(
 				sh.stopFallback()
 				sh.resetVideoTimeline()
 				seenIRAP = true
+				sh.sessionKey.Store(true)
+				sh.needKey.Store(false)
+				sh.state.Store(int32(StateOnline))
 				sh.log.Info("first IRAP received, seamless transition to camera",
 					"delay_ms", time.Since(connectTime265).Milliseconds())
 			}
@@ -1024,78 +1201,44 @@ func (sh *StreamHandler) registerCallback(
 	}
 }
 
-// updateDimensionsFromSPS parses the H.264 SPS to extract width/height
-// and updates the fallback generator accordingly. This ensures the fallback
-// frame matches the camera's actual resolution (critical for low streams
-// which are typically 640x480 or similar, not 1920x1080).
-func (sh *StreamHandler) updateDimensionsFromSPS(sps []byte) {
+// noteSPS reads the picture size from an SPS (pure Go, no subprocess) and
+// updates the fallback generator so its frames match the camera resolution.
+// The SPS is only parsed when it differs from the last one seen.
+func (sh *StreamHandler) noteSPS(codec string, sps []byte) {
 	if len(sps) < 4 {
 		return
 	}
 
-	// Minimal SPS parsing: extract pic_width/pic_height from the bitstream.
-	// Full SPS parsing is complex (Exp-Golomb coded), so we use FFmpeg
-	// to probe the resolution from a minimal Annex-B stream.
-	var annexB bytes.Buffer
-	annexB.Write([]byte{0x00, 0x00, 0x00, 0x01})
-	annexB.Write(sps)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "ffmpeg",
-		"-hide_banner",
-		"-f", "h264", "-i", "pipe:0",
-		"-f", "null", "-",
-	)
-	cmd.Stdin = &annexB
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	cmd.Run() // Intentionally ignore error -- we parse stderr for dimensions.
-
-	output := stderr.String()
-	w, h := parseDimensionsFromFFmpeg(output)
-	if w > 0 && h > 0 {
-		sh.fallbackGen.UpdateFrame(nil, w, h)
-		sh.log.Info("updated dimensions from camera SPS",
-			"width", w, "height", h)
+	sh.dimMu.Lock()
+	if bytes.Equal(sh.lastDimSPS, sps) {
+		sh.dimMu.Unlock()
+		return
 	}
-}
+	sh.lastDimSPS = copyBytes(sps)
+	sh.dimMu.Unlock()
 
-// parseDimensionsFromFFmpeg extracts WxH from FFmpeg stderr output.
-// Looks for patterns like "1920x1080" or "640x480" in stream info lines.
-func parseDimensionsFromFFmpeg(output string) (int, int) {
-	// FFmpeg prints lines like: "Stream #0:0: Video: h264 ..., 1920x1080, ..."
-	// We look for NxM patterns where N and M are reasonable dimensions.
 	var w, h int
-	for i := 0; i < len(output)-4; i++ {
-		if output[i] >= '1' && output[i] <= '9' {
-			// Try to parse WxH
-			j := i
-			for j < len(output) && output[j] >= '0' && output[j] <= '9' {
-				j++
-			}
-			if j < len(output) && output[j] == 'x' {
-				k := j + 1
-				for k < len(output) && output[k] >= '0' && output[k] <= '9' {
-					k++
-				}
-				if k > j+1 {
-					wStr := output[i:j]
-					hStr := output[j+1 : k]
-					var tw, th int
-					fmt.Sscanf(wStr, "%d", &tw)
-					fmt.Sscanf(hStr, "%d", &th)
-					if tw >= 160 && tw <= 7680 && th >= 120 && th <= 4320 {
-						w, h = tw, th
-						break
-					}
-				}
-			}
+	switch codec {
+	case "h265":
+		var p mch265.SPS
+		if err := p.Unmarshal(sps); err != nil {
+			sh.log.Debug("h265 SPS parse failed", "error", err)
+			return
 		}
+		w, h = p.Width(), p.Height()
+	default:
+		var p mch264.SPS
+		if err := p.Unmarshal(sps); err != nil {
+			sh.log.Debug("h264 SPS parse failed", "error", err)
+			return
+		}
+		w, h = p.Width(), p.Height()
 	}
-	return w, h
+
+	if w >= 16 && h >= 16 {
+		sh.fallbackGen.UpdateFrame(nil, w, h)
+		sh.log.Info("updated dimensions from camera SPS", "width", w, "height", h)
+	}
 }
 
 // resetVideoTimeline is called whenever the video source changes
@@ -1321,6 +1464,9 @@ func (sh *StreamHandler) runSilenceAudio(ctx context.Context) {
 // Keyframe capture (for fallback image)
 // -----------------------------------------------------------------------
 
+// captureKeyframe handles the per-keyframe bookkeeping for H.264: keeps the
+// advertised SPS/PPS current, tracks the picture size and, only in
+// last_frame mode, schedules a PNG snapshot.
 func (sh *StreamHandler) captureKeyframeH264(au [][]byte) {
 	var sps, pps []byte
 	hasIDR := false
@@ -1339,54 +1485,59 @@ func (sh *StreamHandler) captureKeyframeH264(au [][]byte) {
 		}
 	}
 
-	// Update SPS/PPS in the output format.
 	if sps != nil && pps != nil {
-		spsChanged := false
+		// Touch the live description only when something really changed:
+		// gortsplib reads it concurrently to answer DESCRIBE requests.
 		sh.mu.Lock()
 		if sh.desc != nil && len(sh.desc.Medias) > 0 {
 			if h264Fmt, ok := sh.desc.Medias[0].Formats[0].(*format.H264); ok {
-				spsChanged = !bytes.Equal(h264Fmt.SPS, sps)
-				h264Fmt.SPS = sps
-				h264Fmt.PPS = pps
+				if !bytes.Equal(h264Fmt.SPS, sps) || !bytes.Equal(h264Fmt.PPS, pps) {
+					h264Fmt.SPS = copyBytes(sps)
+					h264Fmt.PPS = copyBytes(pps)
+				}
 			}
 		}
 		sh.mu.Unlock()
 
-		// Only probe dimensions when SPS actually changes.
-		if spsChanged {
-			spsCP := copyBytes(sps)
-			go sh.updateDimensionsFromSPS(spsCP)
-		}
+		sh.noteSPS("h264", sps)
 	}
 
 	if hasIDR {
-		// Run FFmpeg keyframe capture in a background goroutine so
-		// it never blocks the RTP callback (decode takes 100ms+).
-		auCopy := make([][]byte, len(au))
-		for i, n := range au {
-			auCopy[i] = copyBytes(n)
-		}
-		go sh.decodeAndStore(auCopy, "h264")
+		sh.scheduleSnapshot(au, "h264")
 	}
 }
 
 func (sh *StreamHandler) captureKeyframeH265(au [][]byte) {
+	isIDR := false
 	for _, nalu := range au {
 		if len(nalu) < 2 {
 			continue
 		}
-		naluType := (nalu[0] >> 1) & 0x3F
-		if naluType == 19 || naluType == 20 {
-			// Run FFmpeg keyframe capture in a background goroutine so
-			// it never blocks the RTP callback (decode takes 100ms+).
-			auCopy := make([][]byte, len(au))
-			for i, n := range au {
-				auCopy[i] = copyBytes(n)
-			}
-			go sh.decodeAndStore(auCopy, "h265")
-			return
+		switch (nalu[0] >> 1) & 0x3F {
+		case 33: // SPS
+			sh.noteSPS("h265", nalu)
+		case 19, 20: // IDR_W_RADL, IDR_N_LP
+			isIDR = true
 		}
 	}
+	if isIDR {
+		sh.scheduleSnapshot(au, "h265")
+	}
+}
+
+// scheduleSnapshot decodes a keyframe to PNG in the background. The PNG is
+// only useful in last_frame mode; in the other modes it would just burn a
+// ffmpeg process every few seconds for nothing.
+func (sh *StreamHandler) scheduleSnapshot(au [][]byte, codec string) {
+	if sh.cfg.FallbackMode != "last_frame" {
+		return
+	}
+	// FFmpeg runs in a goroutine so it never blocks the RTP callback.
+	auCopy := make([][]byte, len(au))
+	for i, n := range au {
+		auCopy[i] = copyBytes(n)
+	}
+	go sh.decodeAndStore(auCopy, codec)
 }
 
 // storeLastCameraKeyframe saves a deep copy of an IRAP (H.265) or IDR (H.264)
@@ -1425,6 +1576,8 @@ func (sh *StreamHandler) storeLastCameraKeyframe(au [][]byte, codec string) {
 	sh.lastCameraVideoAUMu.Lock()
 	sh.lastCameraVideoAU = stored
 	sh.lastCameraVideoAUMu.Unlock()
+
+	sh.saveKeyframe(stored, codec)
 }
 
 func (sh *StreamHandler) decodeAndStore(nalus [][]byte, codec string) {
@@ -1605,6 +1758,15 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 
 	if ctx.Err() != nil {
 		return
+	}
+
+	// Replaying a real camera keyframe (e.g. 2560x1440 HEVC, ~100 KB) at
+	// 15 fps would push ~12 Mbit/s of nothing. Keep the fallback under a
+	// fixed byte budget; tiny generated frames are not affected.
+	if capped := capFallbackFPS(fps, auBytes(frameVariants[0])); capped != fps {
+		sh.log.Info("fallback fps reduced to stay within the bandwidth budget",
+			"configured", fps, "effective", capped, "frame_bytes", auBytes(frameVariants[0]))
+		fps = capped
 	}
 
 	// Set up RTP encoder.

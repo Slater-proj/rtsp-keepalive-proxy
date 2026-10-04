@@ -25,7 +25,8 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 		resolved := camCfg.Effective(cfg.Defaults)
 
 		handlers[name] = NewStreamHandler(name, resolved)
-		slog.Info("registered stream", "name", name, "source", resolved.Source)
+		handlers[name].EnablePersistence(cfg.Server.DataDir)
+		slog.Info("registered stream", "name", name, "source", RedactURL(resolved.Source))
 
 		if resolved.SourceLow != "" {
 			lowName := "low_" + name
@@ -37,21 +38,12 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 				lowResolved.Codec = *camCfg.CodecLow
 			}
 
-			// Use low stream dimensions if configured, otherwise use
-			// a sensible default for sub-streams (typically 640x480).
-			if camCfg.WidthLow != nil {
-				lowResolved.Width = *camCfg.WidthLow
-			} else if lowResolved.Width == 0 {
-				lowResolved.Width = 640
-			}
-			if camCfg.HeightLow != nil {
-				lowResolved.Height = *camCfg.HeightLow
-			} else if lowResolved.Height == 0 {
-				lowResolved.Height = 480
-			}
+			lowResolved.Width, lowResolved.Height = lowDimensions(
+				resolved.Width, resolved.Height, camCfg.WidthLow, camCfg.HeightLow)
 
 			handlers[lowName] = NewStreamHandler(lowName, lowResolved)
-			slog.Info("registered stream", "name", lowName, "source", lowResolved.Source)
+			handlers[lowName].EnablePersistence(cfg.Server.DataDir)
+			slog.Info("registered stream", "name", lowName, "source", RedactURL(lowResolved.Source))
 		}
 	}
 
@@ -92,4 +84,28 @@ func (m *Manager) Stop() {
 // Handlers returns the map of active stream handlers (for health endpoint).
 func (m *Manager) Handlers() map[string]*StreamHandler {
 	return m.handlers
+}
+
+// lowDimensions picks the fallback resolution hint of the low stream. Explicit
+// width_low/height_low win; otherwise a 640-pixel-wide picture is assumed,
+// keeping the aspect ratio of the main stream when it is known (so a 16:9
+// camera gets 640x360, not a stretched 640x480). Without any hint it falls
+// back to 640x480.
+func lowDimensions(mainW, mainH int, wLow, hLow *int) (int, int) {
+	w, h := 640, 480
+	if mainW > 0 && mainH > 0 {
+		h = 640 * mainH / mainW
+		h -= h % 2 // yuv420p needs even dimensions
+	}
+	if wLow != nil {
+		w = *wLow
+		if hLow == nil && mainW > 0 && mainH > 0 {
+			h = w * mainH / mainW
+			h -= h % 2
+		}
+	}
+	if hLow != nil {
+		h = *hLow
+	}
+	return w, h
 }

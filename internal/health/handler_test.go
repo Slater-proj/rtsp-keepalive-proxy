@@ -22,7 +22,7 @@ func newMockProvider() *mockProvider {
 	cfg := config.ResolvedCamera{
 		Source:      "rtsp://localhost/test",
 		BatteryMode: true,
-		Codec:      "h264",
+		Codec:       "h264",
 	}
 	return &mockProvider{
 		handlers: map[string]*proxy.StreamHandler{
@@ -78,5 +78,30 @@ func TestStatusEndpoint(t *testing.T) {
 	}
 	if statuses[0].Codec != "h264" {
 		t.Errorf("codec = %q, want h264", statuses[0].Codec)
+	}
+}
+
+func TestStatusIsSortedAndReportsFallback(t *testing.T) {
+	cfg := config.ResolvedCamera{Source: "rtsp://localhost/test", Codec: "h264"}
+	prov := &mockProvider{handlers: map[string]*proxy.StreamHandler{}}
+	for _, n := range []string{"zeta", "alpha", "low_alpha", "mid"} {
+		prov.handlers[n] = proxy.NewStreamHandler(n, cfg)
+	}
+	srv := NewServer(0, prov)
+	rec := httptest.NewRecorder()
+	srv.handleStatus(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+
+	var got []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	want := []string{"alpha", "low_alpha", "mid", "zeta"}
+	for i, w := range want {
+		if got[i]["name"] != w {
+			t.Fatalf("entry %d = %v, want %s (not sorted)", i, got[i]["name"], w)
+		}
+		if active, ok := got[i]["fallback_active"].(bool); !ok || active {
+			t.Errorf("%s: fallback_active = %v, want false", w, got[i]["fallback_active"])
+		}
 	}
 }

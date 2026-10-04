@@ -220,3 +220,163 @@ cameras:
 		t.Fatal("expected error for invalid per-camera fallback_mode")
 	}
 }
+
+func TestBatteryModeDefaultsToTrueWhenOmitted(t *testing.T) {
+	cfg, err := Parse([]byte(`
+cameras:
+  c1:
+    source: "rtsp://localhost/test"
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.Defaults.BatteryMode {
+		t.Error("battery_mode should default to true when omitted")
+	}
+}
+
+func TestBatteryModeExplicitFalseIsKept(t *testing.T) {
+	cfg, err := Parse([]byte(`
+defaults:
+  battery_mode: false
+cameras:
+  c1:
+    source: "rtsp://localhost/test"
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Defaults.BatteryMode {
+		t.Error("explicit battery_mode: false must be preserved")
+	}
+}
+
+func TestNewDefaults(t *testing.T) {
+	cfg, err := Parse([]byte(`
+cameras:
+  c1:
+    source: "rtsp://localhost/test"
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Defaults.Transport != "tcp" {
+		t.Errorf("default Transport = %q, want tcp", cfg.Defaults.Transport)
+	}
+	if cfg.Defaults.Audio != "auto" {
+		t.Errorf("default Audio = %q, want auto", cfg.Defaults.Audio)
+	}
+	if cfg.Defaults.StallTimeout != 3*time.Second {
+		t.Errorf("default StallTimeout = %v, want 3s", cfg.Defaults.StallTimeout)
+	}
+}
+
+func TestEnvExpansion(t *testing.T) {
+	t.Setenv("RTSP_TEST_PASS", "s3cr$t")
+	cfg, err := Parse([]byte(`
+cameras:
+  c1:
+    source: "rtsp://admin:${RTSP_TEST_PASS}@10.0.0.1/s"
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := cfg.Cameras["c1"].Source; got != "rtsp://admin:s3cr$t@10.0.0.1/s" {
+		t.Errorf("Source = %q", got)
+	}
+}
+
+func TestEnvExpansionKeepsBareDollar(t *testing.T) {
+	cfg, err := Parse([]byte(`
+cameras:
+  c1:
+    source: "rtsp://admin:pa$word@10.0.0.1/s"
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := cfg.Cameras["c1"].Source; got != "rtsp://admin:pa$word@10.0.0.1/s" {
+		t.Errorf("a bare $ must not be expanded, got %q", got)
+	}
+}
+
+func TestEnvExpansionMissingVariable(t *testing.T) {
+	_, err := Parse([]byte(`
+cameras:
+  c1:
+    source: "rtsp://admin:${DEFINITELY_NOT_SET_XYZ}@10.0.0.1/s"
+`))
+	if err == nil {
+		t.Fatal("expected error for undefined environment variable")
+	}
+}
+
+func TestInvalidValues(t *testing.T) {
+	cases := map[string]string{
+		"codec typo":     "codec: H265",
+		"transport":      "transport: sctp",
+		"audio":          "audio: aac",
+		"fps zero-ish":   "fallback_fps: 500",
+		"negative":       "timeout: -5s",
+		"codec_low":      "codec_low: vp9",
+		"negative stall": "stall_timeout: -1s",
+		"negative retry": "retry_interval: -1s",
+		"fallback_fps<0": "fallback_fps: -2",
+	}
+	for name, line := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse([]byte("cameras:\n  c1:\n    source: \"rtsp://x/y\"\n    " + line + "\n"))
+			if err == nil {
+				t.Fatalf("expected an error for %q", line)
+			}
+		})
+	}
+}
+
+func TestInvalidCameraName(t *testing.T) {
+	for _, name := range []string{"has space", "a/b", "it's", "-lead"} {
+		_, err := Parse([]byte("cameras:\n  \"" + name + "\":\n    source: \"rtsp://x/y\"\n"))
+		if err == nil {
+			t.Errorf("expected an error for camera name %q", name)
+		}
+	}
+}
+
+func TestOutputPathCollision(t *testing.T) {
+	_, err := Parse([]byte(`
+cameras:
+  jardin:
+    source: "rtsp://x/main"
+    source_low: "rtsp://x/low"
+  low_jardin:
+    source: "rtsp://y/main"
+`))
+	if err == nil {
+		t.Fatal("expected a collision between jardin/source_low and low_jardin")
+	}
+}
+
+func TestDialTimeout(t *testing.T) {
+	cfg, err := Parse([]byte(`
+defaults:
+  dial_timeout: 1s
+cameras:
+  a:
+    source: "rtsp://x/a"
+  b:
+    source: "rtsp://x/b"
+    dial_timeout: 500ms
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := cfg.Cameras["a"].Effective(cfg.Defaults).DialTimeout; got != time.Second {
+		t.Errorf("a: DialTimeout = %v, want 1s (from defaults)", got)
+	}
+	if got := cfg.Cameras["b"].Effective(cfg.Defaults).DialTimeout; got != 500*time.Millisecond {
+		t.Errorf("b: DialTimeout = %v, want 500ms (override)", got)
+	}
+	if _, err := Parse([]byte("cameras:\n  a:\n    source: \"rtsp://x/a\"\n    dial_timeout: -1s\n")); err == nil {
+		t.Error("negative dial_timeout must be rejected")
+	}
+}
