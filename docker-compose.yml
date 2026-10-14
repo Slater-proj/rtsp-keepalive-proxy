@@ -10,9 +10,13 @@ services:
     restart: unless-stopped
     volumes:
       - ./config.yaml:/etc/rtsp-proxy/config.yaml:ro
+      - ./data:/data   # last camera keyframes (must be writable by the container user)
+    # No RTSP port is published: the RTSP output is unauthenticated and
+    # re-serves your cameras. Frigate/go2rtc reach it on the shared Docker
+    # network as rtsp://rtsp-proxy:8554/<name>. Publish 8554 only if a
+    # consumer outside Docker needs it, and then firewall it.
     ports:
-      - "8554:8554" # RTSP output
-      - "8090:8080" # Health / status (remapped to avoid conflict)
+      - "127.0.0.1:8090:8080" # Health / status, local only
     environment:
       - TZ=Europe/Paris
       # Camera credentials (referenced in config.yaml via ${VAR})

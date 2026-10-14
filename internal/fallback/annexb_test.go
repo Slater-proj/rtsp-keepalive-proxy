@@ -10,7 +10,7 @@ func TestParseAnnexBFourByteStartCode(t *testing.T) {
 	// Two NAL units with 4-byte start codes.
 	data := []byte{
 		0x00, 0x00, 0x00, 0x01, 0x67, 0xAA, 0xBB, // NAL 1: SPS
-		0x00, 0x00, 0x00, 0x01, 0x68, 0xCC,         // NAL 2: PPS
+		0x00, 0x00, 0x00, 0x01, 0x68, 0xCC, // NAL 2: PPS
 	}
 	got := ParseAnnexB(data)
 	want := [][]byte{
@@ -40,7 +40,7 @@ func TestParseAnnexBThreeByteStartCode(t *testing.T) {
 func TestParseAnnexBMixed(t *testing.T) {
 	data := []byte{
 		0x00, 0x00, 0x00, 0x01, 0x67, 0x11, // 4-byte sc
-		0x00, 0x00, 0x01, 0x68, 0x22,        // 3-byte sc
+		0x00, 0x00, 0x01, 0x68, 0x22, // 3-byte sc
 		0x00, 0x00, 0x00, 0x01, 0x65, 0x33, 0x44, // 4-byte sc
 	}
 	got := ParseAnnexB(data)
@@ -96,7 +96,7 @@ func TestStreamNALUs(t *testing.T) {
 	// Same data as TestParseAnnexBFourByteStartCode.
 	data := []byte{
 		0x00, 0x00, 0x00, 0x01, 0x67, 0xAA, 0xBB, // SPS
-		0x00, 0x00, 0x00, 0x01, 0x68, 0xCC,         // PPS
+		0x00, 0x00, 0x00, 0x01, 0x68, 0xCC, // PPS
 	}
 	ch := StreamNALUs(bytes.NewReader(data))
 	var nalus [][]byte
@@ -142,11 +142,11 @@ func TestIsH264VCL(t *testing.T) {
 		nalu []byte
 		want bool
 	}{
-		{[]byte{0x67}, false},         // SPS (type 7)
-		{[]byte{0x68}, false},         // PPS (type 8)
-		{[]byte{0x65, 0x00}, true},    // IDR (type 5)
-		{[]byte{0x41, 0x00}, true},    // Non-IDR slice (type 1)
-		{[]byte{0x06}, false},         // SEI (type 6)
+		{[]byte{0x67}, false},      // SPS (type 7)
+		{[]byte{0x68}, false},      // PPS (type 8)
+		{[]byte{0x65, 0x00}, true}, // IDR (type 5)
+		{[]byte{0x41, 0x00}, true}, // Non-IDR slice (type 1)
+		{[]byte{0x06}, false},      // SEI (type 6)
 		{nil, false},
 	}
 	for _, tt := range tests {
@@ -161,13 +161,13 @@ func TestIsH265VCL(t *testing.T) {
 		nalu []byte
 		want bool
 	}{
-		{[]byte{0x40, 0x01}, false},   // VPS (type 32)
-		{[]byte{0x42, 0x01}, false},   // SPS (type 33)
-		{[]byte{0x44, 0x01}, false},   // PPS (type 34)
-		{[]byte{0x26, 0x01}, true},    // IDR_W_RADL (type 19)
-		{[]byte{0x02, 0x01}, true},    // TRAIL_R (type 1)
+		{[]byte{0x40, 0x01}, false}, // VPS (type 32)
+		{[]byte{0x42, 0x01}, false}, // SPS (type 33)
+		{[]byte{0x44, 0x01}, false}, // PPS (type 34)
+		{[]byte{0x26, 0x01}, true},  // IDR_W_RADL (type 19)
+		{[]byte{0x02, 0x01}, true},  // TRAIL_R (type 1)
 		{nil, false},
-		{[]byte{0x01}, false},         // too short
+		{[]byte{0x01}, false}, // too short
 	}
 	for _, tt := range tests {
 		if got := IsH265VCL(tt.nalu); got != tt.want {
