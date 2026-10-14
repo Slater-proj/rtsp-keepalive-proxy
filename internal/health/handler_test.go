@@ -105,3 +105,23 @@ func TestStatusIsSortedAndReportsFallback(t *testing.T) {
 		}
 	}
 }
+
+func TestStatusExposesFallbackKind(t *testing.T) {
+	srv := NewServer(0, newMockProvider())
+	rec := httptest.NewRecorder()
+	srv.handleStatus(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+
+	var got []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d entries, want 1", len(got))
+	}
+	if got[0]["fallback_kind"] != "none" {
+		t.Errorf("fallback_kind = %v, want none when idle", got[0]["fallback_kind"])
+	}
+	if _, present := got[0]["fallback_since"]; present {
+		t.Error("fallback_since must be omitted when no fallback runs")
+	}
+}

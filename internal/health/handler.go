@@ -76,6 +76,11 @@ type CameraStatus struct {
 	// FallbackActive is true while the generated placeholder stream is what
 	// consumers receive instead of the camera.
 	FallbackActive bool `json:"fallback_active"`
+	// FallbackKind says what consumers receive: "last_keyframe" (replay of the
+	// camera's last frame), "neutral" (generated image) or "none".
+	FallbackKind string `json:"fallback_kind"`
+	// FallbackSince is when the current fallback started (RFC 3339).
+	FallbackSince string `json:"fallback_since,omitempty"`
 }
 
 // handleStatus returns the state of every proxied camera.
@@ -89,6 +94,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			State:          h.GetState().String(),
 			Codec:          h.GetCodec(),
 			FallbackActive: h.FallbackActive(),
+			FallbackKind:   h.FallbackKind(),
+		}
+		if since := h.FallbackSince(); !since.IsZero() {
+			cs.FallbackSince = since.Format(time.RFC3339)
 		}
 		if lo := h.LastOnline(); !lo.IsZero() {
 			cs.LastOnline = lo.Format(time.RFC3339)

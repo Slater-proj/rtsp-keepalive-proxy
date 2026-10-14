@@ -380,3 +380,71 @@ cameras:
 		t.Error("negative dial_timeout must be rejected")
 	}
 }
+
+func TestNeutralFallbackDefaults(t *testing.T) {
+	cfg, err := Parse([]byte("cameras:\n  c1:\n    source: \"rtsp://x/y\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := cfg.Cameras["c1"].Effective(cfg.Defaults)
+	if r.FallbackHold != 5*time.Second {
+		t.Errorf("FallbackHold = %v, want 5s", r.FallbackHold)
+	}
+	if r.FallbackNeutral != "offline" {
+		t.Errorf("FallbackNeutral = %q, want offline", r.FallbackNeutral)
+	}
+	if r.Low {
+		t.Error("Low is set by the manager, never by default")
+	}
+}
+
+func TestNeutralFallbackPerCameraOverride(t *testing.T) {
+	cfg, err := Parse([]byte(`
+defaults:
+  fallback_mode: neutral
+  fallback_hold: 8s
+  fallback_neutral: grey
+cameras:
+  a:
+    source: "rtsp://x/a"
+  b:
+    source: "rtsp://x/b"
+    fallback_hold: 2s
+    fallback_neutral: "file:/data/neutral.jpg"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := cfg.Cameras["a"].Effective(cfg.Defaults)
+	b := cfg.Cameras["b"].Effective(cfg.Defaults)
+	if a.FallbackMode != "neutral" || a.FallbackHold != 8*time.Second || a.FallbackNeutral != "grey" {
+		t.Errorf("a = %+v", a)
+	}
+	if b.FallbackHold != 2*time.Second || b.FallbackNeutral != "file:/data/neutral.jpg" {
+		t.Errorf("b = %+v", b)
+	}
+}
+
+func TestNeutralFallbackInvalid(t *testing.T) {
+	for name, extra := range map[string]string{
+		"unknown kind":    "fallback_neutral: sepia",
+		"empty file path": "fallback_neutral: \"file:\"",
+		"negative hold":   "fallback_hold: -1s",
+		"unknown mode":    "fallback_mode: frozen",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse([]byte("cameras:\n  c1:\n    source: \"rtsp://x/y\"\n    " + extra + "\n"))
+			if err == nil {
+				t.Fatalf("expected an error for %q", extra)
+			}
+		})
+	}
+}
+
+func TestExistingFallbackModesStillValid(t *testing.T) {
+	for _, mode := range []string{"offline", "last_frame", "none", "neutral"} {
+		if _, err := Parse([]byte("defaults:\n  fallback_mode: " + mode + "\ncameras:\n  c1:\n    source: \"rtsp://x/y\"\n")); err != nil {
+			t.Errorf("mode %q rejected: %v", mode, err)
+		}
+	}
+}

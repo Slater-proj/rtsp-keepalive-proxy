@@ -115,6 +115,24 @@ type StreamHandler struct {
 	// Optional on-disk copy of the last camera keyframe (see persist.go).
 	persist *persistence
 
+	// liveKeyframe is true once a keyframe was received from the camera in
+	// THIS process (a keyframe restored from disk does not count).
+	liveKeyframe atomic.Bool
+
+	// Neutral fallback image (see neutral.go).
+	neutralMu      sync.Mutex
+	neutral        neutralFrame
+	neutralEncoder neutralEncoder
+
+	// Fallback state reported by /status.
+	fbMu    sync.Mutex
+	fbKind  string
+	fbSince time.Time
+
+	// Camera H.264 profile/level (from its SPS), guarded by dimMu.
+	camProfile string
+	camLevel   string
+
 	// Last SPS whose dimensions were applied to the fallback generator.
 	dimMu      sync.Mutex
 	lastDimSPS []byte
@@ -1254,6 +1272,9 @@ func (sh *StreamHandler) noteSPS(codec string, sps []byte) {
 			return
 		}
 		w, h = p.Width(), p.Height()
+		sh.dimMu.Lock()
+		sh.camProfile, sh.camLevel = h264Profile(p.ProfileIdc), h264Level(p.LevelIdc)
+		sh.dimMu.Unlock()
 	}
 
 	if w >= 16 && h >= 16 {
@@ -1597,6 +1618,7 @@ func (sh *StreamHandler) storeLastCameraKeyframe(au [][]byte, codec string) {
 	sh.lastCameraVideoAUMu.Lock()
 	sh.lastCameraVideoAU = stored
 	sh.lastCameraVideoAUMu.Unlock()
+	sh.liveKeyframe.Store(true)
 
 	sh.saveKeyframe(stored, codec)
 }
@@ -1667,6 +1689,7 @@ func (sh *StreamHandler) startFallback(ctx context.Context) {
 
 	fbCtx, cancel := context.WithCancel(ctx)
 	sh.fallbackCancel = cancel
+	sh.markFallbackStart()
 	sh.resetVideoTimeline()
 	sh.resetAudioTimeline()
 
@@ -1681,6 +1704,7 @@ func (sh *StreamHandler) startFallback(ctx context.Context) {
 		defer func() {
 			sh.fallbackMu.Lock()
 			sh.fallbackCancel = nil
+			sh.clearFallbackState()
 			sh.fallbackMu.Unlock()
 		}()
 		sh.runFallback(fbCtx)
@@ -1691,6 +1715,7 @@ func (sh *StreamHandler) stopFallback() {
 	sh.fallbackMu.Lock()
 	cancel := sh.fallbackCancel
 	sh.fallbackCancel = nil
+	sh.clearFallbackState()
 	sh.fallbackMu.Unlock()
 
 	if cancel != nil {
@@ -1731,7 +1756,44 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 	cameraAU := sh.lastCameraVideoAU
 	sh.lastCameraVideoAUMu.RUnlock()
 
-	if len(cameraAU) > 0 {
+	// Neutral mode (detection streams): keep the last real frame for
+	// fallback_hold, then serve the neutral image. Right after a start there
+	// is no live keyframe: the restored one may contain a person and is never
+	// shown, the neutral image is served at once.
+	neutralMode := sh.neutralEnabled()
+	var (
+		neutralAU      [][]byte
+		servingNeutral bool
+		switchAt       time.Time
+	)
+	if neutralMode {
+		if len(cameraAU) > 0 && sh.liveKeyframe.Load() {
+			frameVariants = append(frameVariants, cameraAU)
+			switchAt = time.Now().Add(sh.cfg.FallbackHold)
+			sh.setFallbackKind("last_keyframe")
+			sh.log.Info("fallback: holding the last camera keyframe before the neutral image",
+				"hold", sh.cfg.FallbackHold.String(), "kind", sh.neutralKind())
+			go func() { // warm the neutral frame while the hold runs
+				if _, err := sh.ensureNeutral(); err != nil {
+					sh.log.Warn("neutral frame not ready", "error", err)
+				}
+			}()
+		} else {
+			au, err := sh.ensureNeutral()
+			if err != nil {
+				sh.log.Error("fallback: neutral image unavailable, not serving the stored keyframe", "error", err)
+				return
+			}
+			neutralAU, servingNeutral = au, true
+			frameVariants = append(frameVariants, au)
+			sh.setFallbackKind("neutral")
+			sh.log.Info("fallback: serving the neutral image", "kind", sh.neutralKind())
+		}
+	}
+
+	if len(frameVariants) > 0 {
+		// neutral mode already chose
+	} else if len(cameraAU) > 0 {
 		frameVariants = append(frameVariants, cameraAU)
 		sh.log.Info("fallback: using last camera keyframe")
 	} else if len(sh.preBaseAU) > 0 {
@@ -1740,6 +1802,7 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		if len(sh.preDotAU) > 0 {
 			frameVariants = append(frameVariants, sh.preDotAU)
 		}
+		sh.setFallbackKind("neutral")
 		sh.log.Info("fallback: using pre-encoded frames")
 	} else {
 		// Slow path: encode on-the-fly (should rarely happen).
@@ -1842,6 +1905,7 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 
 	ticker := time.NewTicker(time.Second / time.Duration(fps))
 	defer ticker.Stop()
+	neutralWarned := false
 
 	for {
 		select {
@@ -1851,14 +1915,39 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 		case <-ticker.C:
 		}
 
+		// End of the hold: replace the last real frame by the neutral image.
+		if neutralMode && !servingNeutral && !time.Now().Before(switchAt) {
+			n, err := sh.ensureNeutral()
+			if err != nil {
+				if !neutralWarned {
+					neutralWarned = true
+					sh.log.Error("fallback: neutral image unavailable, still replaying the last frame", "error", err)
+				}
+			} else {
+				neutralAU, servingNeutral = n, true
+				sh.setFallbackKind("neutral")
+				sh.log.Info("fallback: switching to neutral",
+					"kind", sh.neutralKind(), "hold", sh.cfg.FallbackHold.String())
+				fps = neutralFPS
+				tsInc = clockRate / uint32(fps)
+				ticker.Reset(time.Second / time.Duration(fps))
+			}
+		}
+
 		au := frameVariants[variantIdx]
+		if servingNeutral {
+			// Own parameter sets, deliberately NOT normalised to the camera's.
+			au = neutralAU
+		}
 
 		// Normalise VPS/SPS/PPS in the fallback AU to match the SDP.
 		// Pre-encoded frames may contain libx265/libx264 parameter sets
 		// that differ from the camera's (stored in initialVPS/SPS/PPS).
 		// Without this, the HEVCDecoderConfigurationRecord in MP4 segments
 		// doesn't match the actual NALUs → "No new valid recording segments".
-		if codec == "h265" && fbVPS != nil {
+		if servingNeutral {
+			// keep the neutral frame untouched
+		} else if codec == "h265" && fbVPS != nil {
 			au = ensureVPSSPSPPS(au, fbVPS, fbSPS, fbPPS)
 		} else if codec == "h264" && fbSPS != nil {
 			au = ensureSPSPPS(au, fbSPS, fbPPS)
@@ -1898,6 +1987,18 @@ func (sh *StreamHandler) runFallback(ctx context.Context) {
 // encodePNGToAU encodes PNG data to H.264/H.265 NAL units via FFmpeg.
 // Returns the filtered access unit, plus VPS (H.265 only), SPS, and PPS.
 func (sh *StreamHandler) encodePNGToAU(pngData []byte, w, h int, codec string) (au [][]byte, vps, sps, pps []byte) {
+	return sh.encodePNGToAUProfile(pngData, w, h, codec, "", "")
+}
+
+// encodePNGToAUProfile is encodePNGToAU with an explicit H.264 profile and
+// level (defaults: baseline, 3.1).
+func (sh *StreamHandler) encodePNGToAUProfile(pngData []byte, w, h int, codec, profile, level string) (au [][]byte, vps, sps, pps []byte) {
+	if profile == "" {
+		profile = "baseline"
+	}
+	if level == "" {
+		level = "3.1"
+	}
 	tmpFile, err := os.CreateTemp("", fmt.Sprintf("fb-enc-%s-*.png", sh.Name))
 	if err != nil {
 		sh.log.Error("encodePNGToAU: temp file", "error", err)
@@ -1927,8 +2028,8 @@ func (sh *StreamHandler) encodePNGToAU(pngData []byte, w, h int, codec string) (
 	default:
 		encoderArgs = []string{
 			"-preset", "ultrafast",
-			"-profile:v", "baseline",
-			"-level", "3.1",
+			"-profile:v", profile,
+			"-level", level,
 			"-x264-params", "keyint=1:min-keyint=1:scenecut=0:bframes=0:repeat-headers=1",
 		}
 	}

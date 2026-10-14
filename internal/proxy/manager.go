@@ -32,6 +32,7 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 			lowName := "low_" + name
 			lowResolved := resolved
 			lowResolved.Source = resolved.SourceLow
+			lowResolved.Low = true
 
 			// Apply codec_low override if configured.
 			if camCfg.CodecLow != nil {

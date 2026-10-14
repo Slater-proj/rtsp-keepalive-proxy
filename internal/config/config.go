@@ -37,10 +37,15 @@ type CameraDefaults struct {
 	DialTimeout   time.Duration `yaml:"dial_timeout"`  // 0 = automatic (3 s battery, 5 s otherwise)
 	StallTimeout  time.Duration `yaml:"stall_timeout"` // no video for this long -> start fallback
 	FallbackFPS   int           `yaml:"fallback_fps"`
-	FallbackMode  string        `yaml:"fallback_mode"` // "offline", "last_frame", "none"
-	Codec         string        `yaml:"codec"`
-	Transport     string        `yaml:"transport"` // "tcp", "udp", "auto"
-	Audio         string        `yaml:"audio"`     // "auto", "none"
+	FallbackMode  string        `yaml:"fallback_mode"` // "offline", "last_frame", "none", "neutral"
+	// FallbackHold (neutral mode): how long the last real frame is kept
+	// after the camera stops, before the neutral image replaces it.
+	FallbackHold time.Duration `yaml:"fallback_hold"`
+	// FallbackNeutral (neutral mode): "offline", "black", "grey" or "file:<path>".
+	FallbackNeutral string `yaml:"fallback_neutral"`
+	Codec           string `yaml:"codec"`
+	Transport       string `yaml:"transport"` // "tcp", "udp", "auto"
+	Audio           string `yaml:"audio"`     // "auto", "none"
 }
 
 // CameraConfig holds per-camera settings. Pointer fields allow distinguishing
@@ -59,34 +64,38 @@ type CameraConfig struct {
 	WidthLow  *int `yaml:"width_low,omitempty"`
 	HeightLow *int `yaml:"height_low,omitempty"`
 
-	BatteryMode   *bool          `yaml:"battery_mode,omitempty"`
-	RetryInterval *time.Duration `yaml:"retry_interval,omitempty"`
-	Timeout       *time.Duration `yaml:"timeout,omitempty"`
-	DialTimeout   *time.Duration `yaml:"dial_timeout,omitempty"`
-	StallTimeout  *time.Duration `yaml:"stall_timeout,omitempty"`
-	FallbackFPS   *int           `yaml:"fallback_fps,omitempty"`
-	FallbackMode  *string        `yaml:"fallback_mode,omitempty"` // "offline", "last_frame", "none"
-	Codec         *string        `yaml:"codec,omitempty"`
-	CodecLow      *string        `yaml:"codec_low,omitempty"` // codec for source_low (defaults to codec)
-	Transport     *string        `yaml:"transport,omitempty"`
-	Audio         *string        `yaml:"audio,omitempty"`
+	BatteryMode     *bool          `yaml:"battery_mode,omitempty"`
+	RetryInterval   *time.Duration `yaml:"retry_interval,omitempty"`
+	Timeout         *time.Duration `yaml:"timeout,omitempty"`
+	DialTimeout     *time.Duration `yaml:"dial_timeout,omitempty"`
+	StallTimeout    *time.Duration `yaml:"stall_timeout,omitempty"`
+	FallbackFPS     *int           `yaml:"fallback_fps,omitempty"`
+	FallbackMode    *string        `yaml:"fallback_mode,omitempty"` // "offline", "last_frame", "none", "neutral"
+	FallbackHold    *time.Duration `yaml:"fallback_hold,omitempty"`
+	FallbackNeutral *string        `yaml:"fallback_neutral,omitempty"`
+	Codec           *string        `yaml:"codec,omitempty"`
+	CodecLow        *string        `yaml:"codec_low,omitempty"` // codec for source_low (defaults to codec)
+	Transport       *string        `yaml:"transport,omitempty"`
+	Audio           *string        `yaml:"audio,omitempty"`
 }
 
 // Effective returns a resolved copy where nil fields are filled from defaults.
 func (c CameraConfig) Effective(d CameraDefaults) ResolvedCamera {
 	r := ResolvedCamera{
-		Source:        c.Source,
-		SourceLow:     c.SourceLow,
-		BatteryMode:   d.BatteryMode,
-		RetryInterval: d.RetryInterval,
-		Timeout:       d.Timeout,
-		DialTimeout:   d.DialTimeout,
-		StallTimeout:  d.StallTimeout,
-		FallbackFPS:   d.FallbackFPS,
-		FallbackMode:  d.FallbackMode,
-		Codec:         d.Codec,
-		Transport:     d.Transport,
-		Audio:         d.Audio,
+		Source:          c.Source,
+		SourceLow:       c.SourceLow,
+		BatteryMode:     d.BatteryMode,
+		RetryInterval:   d.RetryInterval,
+		Timeout:         d.Timeout,
+		DialTimeout:     d.DialTimeout,
+		StallTimeout:    d.StallTimeout,
+		FallbackFPS:     d.FallbackFPS,
+		FallbackMode:    d.FallbackMode,
+		FallbackHold:    d.FallbackHold,
+		FallbackNeutral: d.FallbackNeutral,
+		Codec:           d.Codec,
+		Transport:       d.Transport,
+		Audio:           d.Audio,
 	}
 	if c.Width != nil {
 		r.Width = *c.Width
@@ -115,6 +124,12 @@ func (c CameraConfig) Effective(d CameraDefaults) ResolvedCamera {
 	if c.FallbackMode != nil {
 		r.FallbackMode = *c.FallbackMode
 	}
+	if c.FallbackHold != nil {
+		r.FallbackHold = *c.FallbackHold
+	}
+	if c.FallbackNeutral != nil {
+		r.FallbackNeutral = *c.FallbackNeutral
+	}
 	if c.Codec != nil {
 		r.Codec = *c.Codec
 	}
@@ -129,20 +144,25 @@ func (c CameraConfig) Effective(d CameraDefaults) ResolvedCamera {
 
 // ResolvedCamera is a fully-resolved camera configuration with no nil fields.
 type ResolvedCamera struct {
-	Source        string
-	SourceLow     string
-	Width         int // fallback resolution hint (0 = auto-detect or default 1920)
-	Height        int // fallback resolution hint (0 = auto-detect or default 1080)
-	BatteryMode   bool
-	RetryInterval time.Duration
-	Timeout       time.Duration
-	DialTimeout   time.Duration // 0 = automatic
-	StallTimeout  time.Duration
-	FallbackFPS   int
-	FallbackMode  string // "offline", "last_frame", "none"
-	Codec         string
-	Transport     string // "tcp", "udp", "auto"
-	Audio         string // "auto", "none"
+	Source          string
+	SourceLow       string
+	Width           int // fallback resolution hint (0 = auto-detect or default 1920)
+	Height          int // fallback resolution hint (0 = auto-detect or default 1080)
+	BatteryMode     bool
+	RetryInterval   time.Duration
+	Timeout         time.Duration
+	DialTimeout     time.Duration // 0 = automatic
+	StallTimeout    time.Duration
+	FallbackFPS     int
+	FallbackMode    string        // "offline", "last_frame", "none", "neutral"
+	FallbackHold    time.Duration // neutral mode: delay before the neutral image
+	FallbackNeutral string        // neutral mode: offline | black | grey | file:<path>
+	// Low marks a low-quality (detection) stream built from source_low. Not
+	// read from YAML: set by the manager.
+	Low       bool
+	Codec     string
+	Transport string // "tcp", "udp", "auto"
+	Audio     string // "auto", "none"
 }
 
 // Load reads and parses a YAML configuration file.
@@ -246,6 +266,12 @@ func applyGlobalDefaults(d *CameraDefaults) {
 	if d.FallbackMode == "" {
 		d.FallbackMode = "offline"
 	}
+	if d.FallbackHold == 0 {
+		d.FallbackHold = 5 * time.Second
+	}
+	if d.FallbackNeutral == "" {
+		d.FallbackNeutral = "offline"
+	}
 	if d.Codec == "" {
 		d.Codec = "auto"
 	}
@@ -274,9 +300,7 @@ func validate(cfg *Config) error {
 	if len(cfg.Cameras) == 0 {
 		return fmt.Errorf("config: no cameras defined")
 	}
-	if err := validateSettings("defaults", cfg.Defaults.FallbackMode, cfg.Defaults.Codec,
-		cfg.Defaults.Transport, cfg.Defaults.Audio, cfg.Defaults.FallbackFPS,
-		cfg.Defaults.RetryInterval, cfg.Defaults.Timeout, cfg.Defaults.StallTimeout, cfg.Defaults.DialTimeout); err != nil {
+	if err := validateResolved("defaults", CameraConfig{}.Effective(cfg.Defaults)); err != nil {
 		return err
 	}
 
@@ -313,9 +337,7 @@ func validate(cfg *Config) error {
 			}
 		}
 
-		r := cam.Effective(cfg.Defaults)
-		if err := validateSettings(fmt.Sprintf("camera %q", name), r.FallbackMode, r.Codec,
-			r.Transport, r.Audio, r.FallbackFPS, r.RetryInterval, r.Timeout, r.StallTimeout, r.DialTimeout); err != nil {
+		if err := validateResolved(fmt.Sprintf("camera %q", name), cam.Effective(cfg.Defaults)); err != nil {
 			return err
 		}
 		if cam.CodecLow != nil && !oneOf(*cam.CodecLow, "auto", "h264", "h265") {
@@ -325,33 +347,42 @@ func validate(cfg *Config) error {
 	return nil
 }
 
-func validateSettings(who, fallbackMode, codec, transport, audio string, fps int, retry, timeout, stall, dial time.Duration) error {
-	if !oneOf(fallbackMode, "offline", "last_frame", "none") {
-		return fmt.Errorf("config: %s: invalid fallback_mode %q (must be offline, last_frame, or none)", who, fallbackMode)
+func validateResolved(who string, r ResolvedCamera) error {
+	if !oneOf(r.FallbackMode, "offline", "last_frame", "none", "neutral") {
+		return fmt.Errorf("config: %s: invalid fallback_mode %q (must be offline, last_frame, neutral or none)", who, r.FallbackMode)
 	}
-	if !oneOf(codec, "auto", "h264", "h265") {
-		return fmt.Errorf("config: %s: invalid codec %q (must be auto, h264 or h265)", who, codec)
+	if !oneOf(r.Codec, "auto", "h264", "h265") {
+		return fmt.Errorf("config: %s: invalid codec %q (must be auto, h264 or h265)", who, r.Codec)
 	}
-	if !oneOf(transport, "tcp", "udp", "auto") {
-		return fmt.Errorf("config: %s: invalid transport %q (must be tcp, udp or auto)", who, transport)
+	if !oneOf(r.Transport, "tcp", "udp", "auto") {
+		return fmt.Errorf("config: %s: invalid transport %q (must be tcp, udp or auto)", who, r.Transport)
 	}
-	if !oneOf(audio, "auto", "none") {
-		return fmt.Errorf("config: %s: invalid audio %q (must be auto or none)", who, audio)
+	if !oneOf(r.Audio, "auto", "none") {
+		return fmt.Errorf("config: %s: invalid audio %q (must be auto or none)", who, r.Audio)
 	}
-	if fps < 1 || fps > 60 {
-		return fmt.Errorf("config: %s: fallback_fps %d out of range (1-60)", who, fps)
+	if r.FallbackFPS < 1 || r.FallbackFPS > 60 {
+		return fmt.Errorf("config: %s: fallback_fps %d out of range (1-60)", who, r.FallbackFPS)
 	}
-	if retry <= 0 {
+	if r.RetryInterval <= 0 {
 		return fmt.Errorf("config: %s: retry_interval must be positive", who)
 	}
-	if timeout <= 0 {
+	if r.Timeout <= 0 {
 		return fmt.Errorf("config: %s: timeout must be positive", who)
 	}
-	if stall <= 0 {
+	if r.StallTimeout <= 0 {
 		return fmt.Errorf("config: %s: stall_timeout must be positive", who)
 	}
-	if dial < 0 {
+	if r.DialTimeout < 0 {
 		return fmt.Errorf("config: %s: dial_timeout must not be negative", who)
+	}
+	if r.FallbackHold < 0 {
+		return fmt.Errorf("config: %s: fallback_hold must not be negative", who)
+	}
+	switch {
+	case oneOf(r.FallbackNeutral, "offline", "black", "grey"):
+	case strings.HasPrefix(r.FallbackNeutral, "file:") && len(r.FallbackNeutral) > len("file:"):
+	default:
+		return fmt.Errorf("config: %s: invalid fallback_neutral %q (must be offline, black, grey or file:<path>)", who, r.FallbackNeutral)
 	}
 	return nil
 }

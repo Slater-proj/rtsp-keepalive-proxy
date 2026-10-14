@@ -94,7 +94,9 @@ defaults:
   dial_timeout: 0s        # TCP connect timeout, 0 = automatic (3s battery / 5s)
   stall_timeout: 3s       # No VIDEO before the fallback takes over (default 3s)
   fallback_fps: 5         # FPS of the still-image fallback stream (1-60, default 5)
-  fallback_mode: offline  # offline | last_frame | none
+  fallback_mode: offline  # offline | last_frame | neutral | none
+  fallback_hold: 5s       # neutral mode: keep the last real frame this long (default 5s)
+  fallback_neutral: offline # neutral mode: offline | black | grey | file:<path>
   codec: auto             # auto | h264 | h265
   transport: tcp          # tcp | udp | auto  (default tcp)
   audio: auto             # auto (relay G.711, else silence) | none
@@ -130,7 +132,17 @@ If `defaults.battery_mode` is omitted it is `true`. The configuration is validat
 |------|-----------------------------------------------|
 | `offline` | A generated `<NAME> - OFFLINE` image **until the camera has streamed once**. After that, the camera's **last keyframe** is replayed (see below). |
 | `last_frame` | Same replay of the camera's last keyframe; additionally a PNG snapshot is kept (costs one short FFmpeg run per 5 s of live video). |
+| `neutral` | Main stream: same as `offline`. **Low (detection) stream**: the last camera frame for `fallback_hold`, then a neutral image (`fallback_neutral`) at 2 fps. See below. |
 | `none` | Nothing: consumers see a disconnect. |
+
+#### Why `neutral`
+
+When a camera falls asleep with a person still in view, replaying its last keyframe makes an object detector see a motionless person for as long as the camera sleeps (hours): endless notifications and a presence that never ends. With `fallback_mode: neutral` the detection stream (`low_<name>`) switches to a neutral image after `fallback_hold`.
+
+- It applies to the **low** stream only. That stream is decoded for detection and never recorded, so the neutral frame may carry its own parameter sets (the decoder re-initialises on the in-band SPS/PPS at the IDR). The profile, level and size of the neutral frame follow the camera's SPS so that a hardware decoder has no reason to restart.
+- The **main** (recorded) stream keeps replaying the camera frame: an MP4 recorder needs the camera's own parameter sets.
+- Right after a start the keyframe restored from `data_dir` is never shown (it may contain a person): the neutral image is served at once.
+- `/status` reports `fallback_kind` (`last_keyframe`, `neutral` or `none`) and `fallback_since`.
 
 Why the last camera keyframe is preferred over the generated image once available: a generated frame carries its own SPS/PPS (or VPS/SPS/PPS), and MP4 recording in Frigate (`-c copy`) writes one codec configuration per segment. Mixing two encoders' parameter sets in one segment makes it unplayable.
 
@@ -229,7 +241,7 @@ The proxy cannot make a sleeping camera wake faster. For intrusion alerts, keep 
 
 ```json
 [
-  {"name": "entree",     "state": "sleeping", "codec": "h265", "last_online": "2026-02-26T10:25:00Z", "fallback_active": true},
+  {"name": "entree",     "state": "sleeping", "codec": "h265", "last_online": "2026-02-26T10:25:00Z", "fallback_active": true, "fallback_kind": "neutral", "fallback_since": "2026-02-26T10:26:10Z"},
   {"name": "jardin",     "state": "online",   "codec": "h265", "last_online": "2026-02-26T10:30:00Z", "fallback_active": false},
   {"name": "low_jardin", "state": "online",   "codec": "h264", "last_online": "2026-02-26T10:30:00Z", "fallback_active": false}
 ]

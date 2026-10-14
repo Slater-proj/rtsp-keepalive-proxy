@@ -31,7 +31,17 @@ defaults:
   #   offline    — dark frame with "OFFLINE – <camera>" overlay (default)
   #   last_frame — last captured keyframe from the camera
   #   none       — no fallback stream (Frigate sees a disconnect)
+  #   neutral    — like offline for the main stream; the LOW (detection) stream
+  #                keeps the last camera frame for fallback_hold, then serves a
+  #                neutral image so that a person caught in the last frame is not
+  #                "seen" for hours by the object detector
   fallback_mode: offline
+  # neutral mode only: how long the last real frame is kept after the camera
+  # stops (avoids an abrupt change for the decoder). 0 = default (5s).
+  fallback_hold: 5s
+  # neutral mode only: offline (the "OFFLINE" image), black, grey or
+  # file:/path/to/image.png (resized to the camera's size by ffmpeg)
+  fallback_neutral: offline
   # Video codec: auto (detect from camera SDP), h264, h265
   codec: auto
   # Transport used towards the cameras: tcp (recommended for WiFi cameras,
