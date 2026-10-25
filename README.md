@@ -28,7 +28,9 @@ Fallback behaviour is configurable per camera: **offline overlay**, **last captu
 - **Per-camera config** — override battery mode, timeouts, FPS, fallback individually
 - **Low + high quality** — `source_low` auto-creates a `low_<name>` output path
 - **Health & status API** — HTTP endpoints for monitoring
-- **Tiny footprint** — ~30 MB Docker image (Alpine + Go binary + FFmpeg)
+- **Fast takeover** — the fallback starts when the camera closes the connection, or after `stall_timeout` (3 s by default) without video, instead of waiting for the full `timeout`
+- **Safe audio** — G.711 camera audio is relayed (µ-law is converted to A-law); any other codec is replaced by silence rather than corrupting the track
+- **Small footprint** — Alpine + a static Go binary + FFmpeg, runs as a non-root user
 
 ## Quick Start
 
@@ -83,14 +85,21 @@ server:
   rtsp_port: 8554        # Output RTSP port
   health_port: 8080      # HTTP health/status port
   log_level: info         # debug | info | warn | error
+  data_dir: /data         # optional: persist the last camera keyframe across restarts
 
 defaults:
   battery_mode: true      # Enable sleep detection + fallback
-  retry_interval: 1s      # Time between reconnection attempts
-  timeout: 5s             # No-packet duration before declaring sleep
-  fallback_fps: 5         # FPS of the still-image fallback stream (min 2)
-  fallback_mode: offline  # offline | last_frame | none
+  retry_interval: 3s      # Time between reconnection attempts (default 3s)
+  timeout: 10s            # No packet at all before the connection is dropped (default 10s)
+  dial_timeout: 0s        # TCP connect timeout, 0 = automatic (3s battery / 5s)
+  stall_timeout: 3s       # No VIDEO before the fallback takes over (default 3s)
+  fallback_fps: 5         # FPS of the still-image fallback stream (1-60, default 5)
+  fallback_mode: offline  # offline | last_frame | neutral | none
+  fallback_hold: 5s       # neutral mode: keep the last real frame this long (default 5s)
+  fallback_neutral: offline # neutral mode: offline | black | grey | file:<path>
   codec: auto             # auto | h264 | h265
+  transport: tcp          # tcp | udp | auto  (default tcp)
+  audio: auto             # auto (relay G.711, else silence) | none
 
 cameras:
   my_camera:
@@ -108,9 +117,38 @@ cameras:
     battery_mode: true
     retry_interval: 1s
     timeout: 5s
+    stall_timeout: 2s
     fallback_fps: 5
     fallback_mode: offline
+    transport: tcp
+    audio: auto
 ```
+
+If `defaults.battery_mode` is omitted it is `true`. The configuration is validated at start-up: unknown codecs, transports or fallback modes, out-of-range values, invalid camera names and colliding output paths (`low_x` produced by `x` + `source_low` and a camera named `low_x`) are rejected with an explicit error.
+
+### Fallback modes
+
+| Mode | What consumers receive while the camera sleeps |
+|------|-----------------------------------------------|
+| `offline` | A generated `<NAME> - OFFLINE` image **until the camera has streamed once**. After that, the camera's **last keyframe** is replayed (see below). |
+| `last_frame` | Same replay of the camera's last keyframe; additionally a PNG snapshot is kept (costs one short FFmpeg run per 5 s of live video). |
+| `neutral` | Main stream: same as `offline`. **Low (detection) stream**: the last camera frame for `fallback_hold`, then a neutral image (`fallback_neutral`) at 2 fps. See below. |
+| `none` | Nothing: consumers see a disconnect. |
+
+#### Why `neutral`
+
+When a camera falls asleep with a person still in view, replaying its last keyframe makes an object detector see a motionless person for as long as the camera sleeps (hours): endless notifications and a presence that never ends. With `fallback_mode: neutral` the detection stream (`low_<name>`) switches to a neutral image after `fallback_hold`.
+
+- It applies to the **low** stream only. That stream is decoded for detection and never recorded, so the neutral frame may carry its own parameter sets (the decoder re-initialises on the in-band SPS/PPS at the IDR). The profile, level and size of the neutral frame follow the camera's SPS so that a hardware decoder has no reason to restart.
+- The **main** (recorded) stream keeps replaying the camera frame: an MP4 recorder needs the camera's own parameter sets.
+- Right after a start the keyframe restored from `data_dir` is never shown (it may contain a person): the neutral image is served at once.
+- `/status` reports `fallback_kind` (`last_keyframe`, `neutral` or `none`) and `fallback_since`.
+
+Why the last camera keyframe is preferred over the generated image once available: a generated frame carries its own SPS/PPS (or VPS/SPS/PPS), and MP4 recording in Frigate (`-c copy`) writes one codec configuration per segment. Mixing two encoders' parameter sets in one segment makes it unplayable.
+
+### Audio
+
+The output always carries a G.711 A-law (PCMA, 8 kHz, mono) audio track so consumers never lose it. Camera audio is relayed only when it is G.711 8 kHz mono; µ-law is converted on the fly. For AAC, Opus or other codecs the proxy logs a warning and keeps the silent track (use `audio: none` to silence the warning). Check your camera's codec with `ffprobe` if the audio sounds wrong.
 
 ### Codec configuration
 
@@ -123,7 +161,9 @@ codec_low: h264   # sub stream = H.264
 
 This eliminates a stream rebuild on the first camera connection. With `codec: auto`, the proxy starts in H.264 mode and must rebuild the entire RTSP session when it discovers H.265 — go2rtc/Frigate must reconnect, adding ~2s delay.
 
-**Environment variable expansion**: use `${VAR}` in config values. Credentials can be passed via environment variables in `docker-compose.yml`.
+**Environment variable expansion**: use `${VAR}` in config values. Credentials can be passed via environment variables in `docker-compose.yml`. Only the braced form is expanded (a `$` inside a password is left alone), and a reference to an undefined variable is a start-up error instead of a silently empty password. Credentials are masked (`rtsp://user:***@host`) in all logs.
+
+**File permissions**: the container runs as a non-root user (uid 10001 by default). Make sure `config.yaml` is readable by it, or set `user: "<uid>:<gid>"` in your compose file.
 
 ## Architecture
 
@@ -167,20 +207,43 @@ ONLINE         SLEEPING (if battery_mode)
   └──────────────┘
 ```
 
+## Battery cameras: what to expect
+
+A wake-up goes through these steps; the proxy only controls the ones in **bold**.
+
+1. The camera's motion sensor fires and the camera boots and joins the WiFi (several seconds, camera side, depends on the WiFi signal).
+2. **The proxy notices the open RTSP port** (a TCP probe every `dial_timeout` + `retry_interval`, about 0.7 s with the suggested values) and opens the main and the sub stream one after the other.
+3. **The first keyframe takes over** from the fallback within ~1-2 s of the camera answering.
+4. The camera goes back to sleep on its own after a while (25-40 s was measured on an IMOU Cell 2). **The fallback takes over after `stall_timeout`** without video.
+
+Recording through the proxy: MP4 recorders write one codec configuration (VPS/SPS/PPS) per session. The proxy therefore always advertises the **camera's own** parameter sets: it keeps the last real keyframe in `data_dir` and replays it as fallback. If the camera announces different parameter sets than the advertised ones (first start with an empty `data_dir`, camera settings changed), the stream is rebuilt once so that consumers reconnect on the right SDP; look for `camera parameter sets differ` in the log. Keep `data_dir` on a persistent volume, writable by the container user.
+
+Useful log lines:
+
+| Line | Meaning |
+|------|---------|
+| `camera unreachable, assuming it is asleep` | Once per sleep; the repeated probes are logged at debug level |
+| `camera online` / `first IDR` or `first IRAP` | Wake-up detected / first keyframe relayed (`delay_ms`) |
+| `session ended online_for=… got_keyframe=…` | One line per wake-up: how long the camera stayed awake and whether it delivered a keyframe |
+| `video stalled, switching to fallback` | No video for `stall_timeout` while the connection was still open |
+| `restored last camera keyframe from disk` | Warm start: the SDP already carries the camera's real parameters |
+
+The proxy cannot make a sleeping camera wake faster. For intrusion alerts, keep the camera's own detection, siren and SD-card recording enabled: they do not depend on the network.
+
 ## API Endpoints
 
 | Endpoint  | Method | Description                          |
 |-----------|--------|--------------------------------------|
 | `/health` | GET    | Returns `{"status": "ok"}` if alive  |
-| `/status` | GET    | JSON array of all camera states      |
+| `/status` | GET    | JSON array of all camera states, sorted by name |
 
 ### Example `/status` response
 
 ```json
 [
-  {"name": "jardin",     "state": "online",   "codec": "h264", "last_online": "2026-02-26T10:30:00Z"},
-  {"name": "low_jardin", "state": "sleeping", "codec": "h264", "last_online": "2026-02-26T10:29:55Z"},
-  {"name": "entree",     "state": "sleeping", "codec": "h265", "last_online": "2026-02-26T10:25:00Z"}
+  {"name": "entree",     "state": "sleeping", "codec": "h265", "last_online": "2026-02-26T10:25:00Z", "fallback_active": true, "fallback_kind": "neutral", "fallback_since": "2026-02-26T10:26:10Z"},
+  {"name": "jardin",     "state": "online",   "codec": "h265", "last_online": "2026-02-26T10:30:00Z", "fallback_active": false},
+  {"name": "low_jardin", "state": "online",   "codec": "h264", "last_online": "2026-02-26T10:30:00Z", "fallback_active": false}
 ]
 ```
 
