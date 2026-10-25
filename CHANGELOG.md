@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0-rc3
+## 0.2.0
 
 ### Added
 - **`fallback_mode: neutral`** for detection streams (`low_<name>`): the last
